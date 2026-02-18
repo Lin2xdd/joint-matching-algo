@@ -1,0 +1,1206 @@
+"""
+Integrated Joint Matching Algorithm
+Single-phase matching with marker alignment, confidence-based forward/backward matching,
+and cumulative length matching for complex joint relationships.
+
+Workflow:
+1. Marker alignment between inspections
+2. For each chunk between markers:
+   - Step 1: Forward matching (high-confidence 1-to-1 matches)
+   - Step 2: Backward matching (high-confidence 1-to-1 matches in gaps)
+   - Step 3: Cumulative matching (aggregate matches for unmatched joints)
+3. Merge all matched results and report unmatched joints
+4. Export to Excel with matched and unmatched tabs
+
+Author: Integrated Joint Matching System
+Date: 2026-02-13
+"""
+
+import uuid
+import numpy as np
+import pandas as pd
+from sqlalchemy import Engine, text
+from typing import Dict, List, Tuple, Optional
+import logging
+from dataclasses import dataclass
+import os
+
+# Import original joint matching functions
+from joint_matching import (
+    joint_diff_calc,
+    pairs_generator,
+    match_pct_calc,
+    unchunk_dataframe,
+    clean_column_none_to_null,
+    smart_column_filter,
+    safe_rename_columns
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _calculate_confidence(length1: float, length2: float, tolerance: float = 0.10) -> float:
+    """Calculate confidence score for a length match."""
+    if length1 <= 0 or length2 <= 0:
+        return 0.0
+    
+    avg_length = (length1 + length2) / 2
+    diff = abs(length1 - length2)
+    diff_ratio = diff / avg_length
+    
+    # Confidence is inverse of difference ratio, normalized to tolerance
+    confidence = 1.0 - (diff_ratio / tolerance)
+    
+    return max(0.0, min(1.0, confidence))
+
+
+def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
+                        init_fix: int, init_move: int,
+                        end_fix: int, end_move: int,
+                        threshold: float, min_confidence: float = 0.80) -> Tuple[pd.DataFrame, int, int]:
+    """
+    Forward match check function with confidence-based filtering.
+    Only matches joints with confidence >= min_confidence.
+    
+    Args:
+        fix: Master dataframe
+        move: Target dataframe
+        init_fix: Starting index in master
+        init_move: Starting index in target
+        end_fix: Ending index in master
+        end_move: Ending index in target
+        threshold: Length difference threshold (legacy parameter, kept for compatibility)
+        min_confidence: Minimum confidence score to accept a match (default 0.80)
+    
+    Returns:
+        Tuple of (matched_pairs DataFrame, fix_break_loc, move_break_loc)
+    """
+    matched_pairs = pd.DataFrame(columns=['FIX_ID', 'MOVE_ID', 'CONFIDENCE', 'SOURCE'])
+    min_move = int(min(end_move - init_move, end_fix - init_fix))
+    fix_break_loc = None
+    move_break_loc = None
+
+    for i in range(min_move + 1):
+        pair1_len_fix = fix.iloc[init_fix + i]['joint_length']
+        pair1_len_move = move.iloc[init_move + i]['joint_length']
+        pair1_confidence = _calculate_confidence(pair1_len_fix, pair1_len_move)
+        
+        try:
+            pair2_len_fix = fix.iloc[init_fix + i + 1]['joint_length']
+            pair2_len_move = move.iloc[init_move + i + 1]['joint_length']
+            pair2_confidence = _calculate_confidence(pair2_len_fix, pair2_len_move)
+        except:
+            pair2_confidence = 0.0
+            
+        try:
+            pair3_len_fix = fix.iloc[init_fix + i + 2]['joint_length']
+            pair3_len_move = move.iloc[init_move + i + 2]['joint_length']
+            pair3_confidence = _calculate_confidence(pair3_len_fix, pair3_len_move)
+        except:
+            pair3_confidence = 0.0
+
+        # Only match if confidence meets threshold
+        if pair1_confidence >= min_confidence:
+            matched_points = pd.DataFrame(
+                [[i + init_fix, i + init_move, pair1_confidence, 'Forward']],
+                columns=matched_pairs.columns
+            )
+            matched_pairs = pd.concat(
+                [matched_pairs, matched_points], ignore_index=True)
+        elif (pair1_confidence < min_confidence) & (pair2_confidence >= min_confidence) & (pair3_confidence >= min_confidence):
+            # Skip this joint but continue if next two are confident
+            matched_points = pd.DataFrame(
+                [[i + init_fix, i + init_move, pair1_confidence, 'Forward']],
+                columns=matched_pairs.columns
+            )
+            matched_pairs = pd.concat(
+                [matched_pairs, matched_points], ignore_index=True)
+        else:
+            fix_break_loc = i + init_fix
+            move_break_loc = i + init_move
+            break
+
+    return matched_pairs, fix_break_loc, move_break_loc
+
+
+def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
+                         init_fix: int, init_move: int,
+                         end_fix: int, end_move: int,
+                         threshold: float, min_confidence: float = 0.80) -> Tuple[pd.DataFrame, int, int]:
+    """
+    Backward match check function with confidence-based filtering.
+    Only matches joints with confidence >= min_confidence.
+    
+    Args:
+        fix: Master dataframe
+        move: Target dataframe
+        init_fix: Starting index in master
+        init_move: Starting index in target
+        end_fix: Ending index in master
+        end_move: Ending index in target
+        threshold: Length difference threshold (legacy parameter, kept for compatibility)
+        min_confidence: Minimum confidence score to accept a match (default 0.80)
+    
+    Returns:
+        Tuple of (matched_pairs DataFrame, fix_break_loc, move_break_loc)
+    """
+    matched_pairs = pd.DataFrame(columns=['FIX_ID', 'MOVE_ID', 'CONFIDENCE', 'SOURCE'])
+    min_move = int(min(end_move - init_move, end_fix - init_fix))
+    fix_break_loc = None
+    move_break_loc = None
+
+    for i in range(1, min_move + 1):
+        pair1_len_fix = fix.iloc[end_fix - i]['joint_length']
+        pair1_len_move = move.iloc[end_move - i]['joint_length']
+        pair1_confidence = _calculate_confidence(pair1_len_fix, pair1_len_move)
+        
+        pair2_len_fix = fix.iloc[end_fix - i - 1]['joint_length']
+        pair2_len_move = move.iloc[end_move - i - 1]['joint_length']
+        pair2_confidence = _calculate_confidence(pair2_len_fix, pair2_len_move)
+        
+        pair3_len_fix = fix.iloc[end_fix - i - 2]['joint_length']
+        pair3_len_move = move.iloc[end_move - i - 2]['joint_length']
+        pair3_confidence = _calculate_confidence(pair3_len_fix, pair3_len_move)
+
+        # Only match if confidence meets threshold
+        if pair1_confidence >= min_confidence:
+            matched_points = pd.DataFrame(
+                [[end_fix - i, end_move - i, pair1_confidence, 'Backward']],
+                columns=matched_pairs.columns
+            )
+            matched_pairs = pd.concat(
+                [matched_pairs, matched_points], ignore_index=True)
+        elif (pair1_confidence < min_confidence) & (pair2_confidence >= min_confidence) & (pair3_confidence >= min_confidence):
+            matched_points = pd.DataFrame(
+                [[end_fix - i, end_move - i, pair1_confidence, 'Backward']],
+                columns=matched_pairs.columns
+            )
+            matched_pairs = pd.concat(
+                [matched_pairs, matched_points], ignore_index=True)
+        else:
+            fix_break_loc = end_fix - i
+            move_break_loc = end_move - i
+            break
+
+    return matched_pairs, fix_break_loc, move_break_loc
+
+
+@dataclass
+class JointMatch:
+    """Represents a match between master and target joints."""
+    master_joints: List[int]
+    target_joints: List[int]
+    match_type: str  # '1-to-1', '1-to-N', 'N-to-1', 'marker', 'original'
+    confidence: float  # 0.0 to 1.0
+    master_total_length: float
+    target_total_length: float
+    length_difference: float
+    
+    def is_split(self) -> bool:
+        """Check if this represents a joint split (1-to-many)."""
+        return len(self.master_joints) == 1 and len(self.target_joints) > 1
+    
+    def is_merge(self) -> bool:
+        """Check if this represents a joint merge (many-to-1)."""
+        return len(self.master_joints) > 1 and len(self.target_joints) == 1
+    
+    def is_simple(self) -> bool:
+        """Check if this is a simple 1-to-1 match."""
+        return len(self.master_joints) == 1 and len(self.target_joints) == 1
+
+
+class CumulativeLengthMatcher:
+    """
+    Cumulative length matching for unmatched joints.
+    Handles 1-to-1, 1-to-many, and many-to-1 matching.
+    """
+    
+    def __init__(self, 
+                 length_tolerance: float = 0.10,
+                 max_aggregate: int = 5,
+                 min_confidence: float = 0.60):
+        """
+        Initialize the cumulative length matcher.
+        
+        Args:
+            length_tolerance: Percentage tolerance for length matching (default 10%)
+            max_aggregate: Maximum number of joints to aggregate (default 5)
+            min_confidence: Minimum confidence to accept a match (default 0.60)
+        """
+        self.length_tolerance = length_tolerance
+        self.max_aggregate = max_aggregate
+        self.min_confidence = min_confidence
+    
+    def _is_length_match(self, length1: float, length2: float) -> bool:
+        """Check if two lengths match within percentage tolerance."""
+        if length1 <= 0 or length2 <= 0:
+            return False
+        
+        avg_length = (length1 + length2) / 2
+        diff = abs(length1 - length2)
+        diff_ratio = diff / avg_length
+        
+        return diff_ratio <= self.length_tolerance
+    
+    def _calculate_confidence(self, length1: float, length2: float) -> float:
+        """Calculate confidence score for a length match."""
+        if length1 <= 0 or length2 <= 0:
+            return 0.0
+        
+        avg_length = (length1 + length2) / 2
+        diff = abs(length1 - length2)
+        diff_ratio = diff / avg_length
+        
+        # Confidence is inverse of difference ratio, normalized to tolerance
+        confidence = 1.0 - (diff_ratio / self.length_tolerance)
+        
+        return max(0.0, min(1.0, confidence))
+    
+    def match_joint(self,
+                   master_df: pd.DataFrame,
+                   m_idx: int,
+                   target_df: pd.DataFrame,
+                   t_idx: int) -> Optional[JointMatch]:
+        """
+        Try to match a joint using cumulative length comparison.
+        
+        Attempts matching in order:
+        1. 1-to-many (master joint split)
+        2. many-to-1 (master joints merged)
+        
+        Note: 1-to-1 matching is now handled by the confidence-based forward/backward
+        matching in the original algorithm, so it's removed from here.
+        
+        Args:
+            master_df: Master inspection joints
+            m_idx: Current master index
+            target_df: Target inspection joints
+            t_idx: Current target index
+        
+        Returns:
+            JointMatch if successful, None otherwise
+        """
+        if m_idx >= len(master_df) or t_idx >= len(target_df):
+            return None
+        
+        master_joint = master_df.iloc[m_idx]
+        target_joint = target_df.iloc[t_idx]
+        
+        # Try 1-to-many (master joint was split into multiple target joints)
+        cumulative_target = 0
+        target_joints_list = []
+        
+        for t_count in range(1, self.max_aggregate + 1):
+            if t_idx + t_count > len(target_df):
+                break
+            
+            current_target = target_df.iloc[t_idx + t_count - 1]
+            cumulative_target += current_target['joint_length']
+            target_joints_list.append(int(current_target['joint_number']))
+            
+            if self._is_length_match(master_joint['joint_length'], cumulative_target):
+                # Penalize confidence slightly for splits (more uncertainty)
+                base_confidence = self._calculate_confidence(
+                    master_joint['joint_length'],
+                    cumulative_target
+                )
+                # Reduce confidence by 5% per additional joint
+                split_penalty = 0.05 * (t_count - 1)
+                confidence = max(base_confidence - split_penalty, 0.0)
+                
+                if confidence >= self.min_confidence:
+                    return JointMatch(
+                        master_joints=[int(master_joint['joint_number'])],
+                        target_joints=target_joints_list.copy(),
+                        match_type=f'1-to-{t_count}',
+                        confidence=confidence,
+                        master_total_length=master_joint['joint_length'],
+                        target_total_length=cumulative_target,
+                        length_difference=abs(master_joint['joint_length'] - 
+                                            cumulative_target)
+                    )
+        
+        # Try many-to-1 (multiple master joints merged into one target joint)
+        cumulative_master = 0
+        master_joints_list = []
+        
+        for m_count in range(1, self.max_aggregate + 1):
+            if m_idx + m_count > len(master_df):
+                break
+            
+            current_master = master_df.iloc[m_idx + m_count - 1]
+            cumulative_master += current_master['joint_length']
+            master_joints_list.append(int(current_master['joint_number']))
+            
+            if self._is_length_match(cumulative_master, target_joint['joint_length']):
+                # Penalize confidence slightly for merges
+                base_confidence = self._calculate_confidence(
+                    cumulative_master,
+                    target_joint['joint_length']
+                )
+                merge_penalty = 0.05 * (m_count - 1)
+                confidence = max(base_confidence - merge_penalty, 0.0)
+                
+                if confidence >= self.min_confidence:
+                    return JointMatch(
+                        master_joints=master_joints_list.copy(),
+                        target_joints=[int(target_joint['joint_number'])],
+                        match_type=f'{m_count}-to-1',
+                        confidence=confidence,
+                        master_total_length=cumulative_master,
+                        target_total_length=target_joint['joint_length'],
+                        length_difference=abs(cumulative_master - 
+                                            target_joint['joint_length'])
+                    )
+        
+        # No match found
+        return None
+
+
+def export_to_excel(matched_joints: pd.DataFrame, 
+                   unmatched_joints: pd.DataFrame,
+                   run_summary: Dict,
+                   output_path: str) -> bool:
+    """
+    Export matching results to Excel with separate tabs for matched and unmatched joints.
+    
+    Args:
+        matched_joints: DataFrame with matched joints
+        unmatched_joints: DataFrame with unmatched joints
+        run_summary: Dictionary with run summary statistics
+        output_path: Path to output Excel file
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Create output directory if needed
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            logger.info(f"Created output directory: {output_dir}")
+        
+        # Build summary DataFrame
+        summary_data = {
+            'Metric': [
+                'Master Inspection GUID',
+                'Master ILI ID',
+                'Target Inspection GUID',
+                'Target ILI ID',
+                'Total Master Joints',
+                'Total Target Joints',
+                'Total Matched Joints',
+                '  - From Original Algorithm',
+                '  - From Cumulative Matching',
+                'Total Unmatched Joints',
+                'Questionable Matches',
+                'Master Match Percentage',
+                'Target Match Percentage',
+                'Flow Direction',
+                'Cumulative Matching Enabled'
+            ],
+            'Value': [
+                run_summary.get('Master_inspection_guid', ''),
+                run_summary.get('Master_ili_id', ''),
+                run_summary.get('Target_inspection_guid', ''),
+                run_summary.get('Target_ili_id', ''),
+                run_summary.get('Total_master_joints', 0),
+                run_summary.get('Total_target_joints', 0),
+                run_summary.get('Matched_joints', 0),
+                run_summary.get('Matched_from_original', 0),
+                run_summary.get('Matched_from_cumulative', 0),
+                run_summary.get('Unmatched_joints', 0),
+                run_summary.get('Questionable_matches', 0),
+                f"{run_summary.get('Master_joint_percentage', 0):.2f}%",
+                f"{run_summary.get('Target_joint_percentage', 0):.2f}%",
+                run_summary.get('Flow_direction', ''),
+                run_summary.get('Cumulative_matching_enabled', False)
+            ]
+        }
+        summary_df = pd.DataFrame(summary_data)
+        
+        # Write to Excel with multiple sheets
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            # Summary tab
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Matched joints tab
+            if not matched_joints.empty:
+                matched_joints.to_excel(writer, sheet_name='Matched Joints', index=False)
+            else:
+                pd.DataFrame({'Message': ['No matched joints']}).to_excel(
+                    writer, sheet_name='Matched Joints', index=False)
+            
+            # Unmatched joints tab
+            if not unmatched_joints.empty:
+                unmatched_joints.to_excel(writer, sheet_name='Unmatched Joints', index=False)
+            else:
+                pd.DataFrame({'Message': ['No unmatched joints']}).to_excel(
+                    writer, sheet_name='Unmatched Joints', index=False)
+        
+        logger.info(f"Results exported to: {os.path.abspath(output_path)}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to export results: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_guids: List[str],
+                                      output_path: Optional[str] = None,
+                                      use_cumulative_for_unmatched: bool = True,
+                                      cumulative_tolerance: float = 0.10,
+                                      cumulative_max_aggregate: int = 5,
+                                      cumulative_min_confidence: float = 0.60) -> Dict:
+    """
+    Execute integrated joint matching algorithm between master and target inspections.
+    
+    Workflow:
+    1. Run original algorithm (marker alignment, forward/backward matching)
+    2. Collect unmatched joints
+    3. Apply cumulative length matching to unmatched joints (if enabled)
+    4. Merge all results
+    5. Export to Excel (if output_path provided)
+    
+    Args:
+        engine: SQLAlchemy engine for database connection
+        master_guid: Master inspection GUID
+        target_guids: List of target inspection GUIDs
+        output_path: Path to output Excel file (optional)
+        use_cumulative_for_unmatched: Apply cumulative matching to unmatched joints
+        cumulative_tolerance: Length tolerance for cumulative matching (default 10%)
+        cumulative_max_aggregate: Max joints to aggregate in cumulative matching
+        cumulative_min_confidence: Min confidence for cumulative matching
+    
+    Returns:
+        Dict with keys: run_summary, matched_joints, unmatched_joints, questionable_joints
+    """
+    logger.info("=" * 80)
+    logger.info("INTEGRATED JOINT MATCHING")
+    logger.info("=" * 80)
+    logger.info(f"Starting integrated matching: master={master_guid}, targets={target_guids}")
+    logger.info(f"Cumulative matching for unmatched: {use_cumulative_for_unmatched}")
+    
+    # Convert GUIDs to appropriate format
+    master_guid_tuple = tuple([master_guid])
+    target_guid_list = tuple(target_guids)
+    all_guid_list = master_guid_tuple + target_guid_list
+    
+    # Build SQL query with proper filtering, distinct, and ordering
+    placeholders = ','.join([f":guid{i}" for i in range(len(all_guid_list))])
+    joint_query = text(f"""
+        SELECT DISTINCT
+               joint_number,
+               joint_length,
+               iliyr,
+               insp_guid,
+               ili_id
+        FROM public.joints
+        WHERE insp_guid IN ({placeholders})
+        ORDER BY insp_guid, CAST(joint_number AS INTEGER)
+    """)
+    
+    # Create parameters dict
+    params = {f'guid{i}': str(guid) for i, guid in enumerate(all_guid_list)}
+    
+    # Query database
+    with engine.connect() as conn:
+        joint_list = pd.read_sql_query(con=conn, sql=joint_query, params=params)
+        
+        # Drop null values
+        smaller_subset = ['joint_number', 'joint_length', 'insp_guid', 'ili_id']
+        joint_list = joint_list.dropna(subset=smaller_subset).reset_index(drop=True)
+    
+    logger.info("Database query successful")
+    
+    # Prepare master dataset - filter and ensure proper ordering
+    joint_list["insp_guid"] = joint_list["insp_guid"].astype("str")
+    fix_df = joint_list.loc[joint_list["insp_guid"] == master_guid_tuple[0]].copy()
+    
+    # Convert joint_number to integer and sort
+    fix_df['joint_number'] = fix_df['joint_number'].astype(int)
+    fix_df = fix_df.sort_values('joint_number').reset_index(drop=True)
+    
+    if fix_df.empty or fix_df["joint_length"].empty:
+        raise ValueError("Master dataset is empty")
+    
+    fix_iliyr = np.unique(fix_df["iliyr"])[0]
+    fix_ili_id = np.unique(fix_df["ili_id"])[0]
+    
+    # Create a mapping from joint_number to joint_length for easy lookup
+    master_length_map = dict(zip(fix_df['joint_number'].astype(int), fix_df['joint_length']))
+    
+    # Process each target GUID
+    results_list = []
+    
+    for target_guid in target_guid_list:
+        logger.info("-" * 80)
+        logger.info(f"Processing target: {target_guid}")
+        
+        move_df = joint_list.loc[joint_list["insp_guid"] == target_guid].copy()
+        
+        # Convert joint_number to integer and sort
+        move_df['joint_number'] = move_df['joint_number'].astype(int)
+        move_df = move_df.sort_values('joint_number').reset_index(drop=True)
+        
+        if move_df.empty or move_df["joint_length"].empty:
+            logger.warning(f"Target {target_guid} is empty, skipping")
+            continue
+        
+        # Create a mapping from joint_number to joint_length for target
+        target_length_map = dict(zip(move_df['joint_number'].astype(int), move_df['joint_length']))
+        
+        RevMove = move_df.loc[::-1]
+        move_iliyr = np.unique(move_df["iliyr"])[0]
+        move_ili_id = np.unique(move_df["ili_id"])[0]
+        
+        logger.info(f"Master {fix_iliyr}: {len(fix_df)} joints, Target {move_iliyr}: {len(move_df)} joints")
+        
+        # ========== INTEGRATED MATCHING: MARKER ALIGNMENT + FORWARD/BACKWARD + CUMULATIVE ==========
+        logger.info("Running integrated matching algorithm (Marker Alignment → Forward/Backward → Cumulative)...")
+        
+        # Flow direction determination
+        column = "joint_length"
+        fix_diff = joint_diff_calc(fix_df, column=column)
+        move_diff = joint_diff_calc(move_df, column=column)
+        RevMove_diff = joint_diff_calc(RevMove, column=column)
+        
+        fix_pairs = pairs_generator(fix_diff)
+        move_pairs = pairs_generator(move_diff)
+        RevMove_pairs = pairs_generator(RevMove_diff)
+        
+        match_pct_move = match_pct_calc(fix_pairs, move_pairs)
+        match_pct_RevMove = match_pct_calc(fix_pairs, RevMove_pairs)
+        
+        if match_pct_move > match_pct_RevMove:
+            direction = "FWD"
+            logger.info(f"  Direction: Forward ({match_pct_move:.2f}%)")
+        elif match_pct_move < match_pct_RevMove:
+            direction = "REV"
+            logger.info(f"  Direction: Reverse ({match_pct_RevMove:.2f}%)")
+        else:
+            direction = "FWD"  # Default to forward on tie
+            logger.warning("  Direction: Tie, defaulting to Forward")
+        
+        # Joint matching algorithm
+        large_diff = 3
+        
+        fix_df['difference'] = fix_df.joint_length.shift(-1) - fix_df.joint_length
+        fix_df['difference'] = fix_df['difference'].fillna(0)
+        fix_df = fix_df.reset_index(drop=True)
+        fix_df = fix_df.rename(columns={"ili_id": "Master_ili_id"})
+        fix_data = fix_df.copy()
+        
+        move_data = move_df.copy()
+        move_data = move_data.rename(columns={"ili_id": "Target_ili_id"})
+        
+        if direction == "Reverse" or direction == "REV":
+            move_data["joint_number_org"] = move_df["joint_number"]
+            move_data = move_data.loc[::-1]
+            move_data["joint_number"] = move_df["joint_number"].astype(
+                int).sort_values(ascending=True).values
+        
+        move_data['difference'] = move_data.joint_length.shift(-1) - move_data.joint_length
+        move_data['difference'] = move_data['difference'].fillna(0)
+        
+        if direction == "Reverse" or direction == "REV":
+            move_data = move_data[["joint_number", "difference",
+                                   "joint_length", "joint_number_org", "Target_ili_id"]]
+        else:
+            move_data = move_data[["joint_number",
+                                   "difference", "joint_length", "Target_ili_id"]]
+        
+        move_data = move_data.reset_index(drop=True)
+        
+        Match_df = pd.DataFrame([], columns=['FIX_ID', 'MOVE_ID', 'CONFIDENCE', 'SOURCE'])
+        Unmatch = pd.DataFrame(
+            columns=['FIX_START', 'FIX_END', 'MOVE_START', 'MOVE_END'])
+        
+        move_marker = move_data[abs(move_data.difference) > large_diff]
+        fix_marker = fix_data[abs(fix_data.difference) > large_diff]
+        
+        j = 0
+        temp_move_match = 0
+        
+        # Find all chunk markers
+        for i in move_marker.index:
+            temp = pd.Series(
+                (abs(move_marker.loc[i]['difference'] - fix_marker.difference[fix_marker.index > j]) < 1) &
+                (abs(move_marker.loc[i]["joint_length"] -
+                 fix_marker.joint_length[fix_marker.index > j]) < 1)
+            )
+            
+            try:
+                next_temp1 = pd.Series(
+                    (abs(move_marker.iloc[move_marker.index.get_loc(i) + 1]['difference'] -
+                         fix_marker.difference[fix_marker.index > temp.idxmax()]) < 1) &
+                    (abs(move_marker.iloc[move_marker.index.get_loc(i) + 1]["joint_length"] -
+                         fix_marker.joint_length[fix_marker.index > temp.idxmax()]) < 1)
+                )
+                next_temp2 = pd.Series(
+                    (abs(move_marker.iloc[move_marker.index.get_loc(i) + 2]['difference'] -
+                         fix_marker.difference[fix_marker.index > next_temp1.idxmax()]) < 1) &
+                    (abs(move_marker.iloc[move_marker.index.get_loc(i) + 2]["joint_length"] -
+                         fix_marker.joint_length[fix_marker.index > next_temp1.idxmax()]) < 1)
+                )
+                next_temp3 = pd.Series(
+                    (abs(move_marker.iloc[move_marker.index.get_loc(i) + 3]['difference'] -
+                         fix_marker.difference[fix_marker.index > next_temp2.idxmax()]) < 1) &
+                    (abs(move_marker.iloc[move_marker.index.get_loc(i) + 3]["joint_length"] -
+                         fix_marker.joint_length[fix_marker.index > next_temp2.idxmax()]) < 1)
+                )
+            except:
+                continue
+            
+            try:
+                fix_diff_sum = np.sum(
+                    fix_data.loc[j:temp.idxmax()].joint_length)
+                move_diff_sum = np.sum(
+                    move_data.loc[temp_move_match:i].joint_length)
+                length_diff = abs(fix_diff_sum - move_diff_sum)
+            except:
+                length_diff = 0.05
+            
+            try:
+                index_diff2 = abs(
+                    abs(next_temp1.idxmax() - move_marker.iloc[[move_marker.index.get_loc(i) + 1]].index) -
+                    abs(temp.idxmax() - i)
+                )
+            except:
+                index_diff2 = 0
+            
+            try:
+                index_diff3 = abs(
+                    abs(next_temp2.idxmax() - move_marker.iloc[[move_marker.index.get_loc(i) + 2]].index) -
+                    abs(temp.idxmax() - i)
+                )
+            except:
+                index_diff3 = 0
+            
+            try:
+                index_diff4 = abs(
+                    abs(next_temp3.idxmax() - move_marker.iloc[[move_marker.index.get_loc(i) + 3]].index) -
+                    abs(temp.idxmax() - i)
+                )
+            except:
+                index_diff4 = 0
+            
+            if Match_df.empty:
+                temp_fix_match = temp.idxmax()
+                matched_points = pd.DataFrame(
+                    [[temp_fix_match, i, 1.0, 'Marker']],
+                    columns=Match_df.columns
+                )
+                Match_df = pd.concat(
+                    [Match_df, matched_points], ignore_index=True)
+                j = temp_fix_match
+                temp_move_match = i
+            else:
+                if (temp.any() & (length_diff < 10)) | (temp.any() & (index_diff2 == 0) & (index_diff3 == 0) & (index_diff4 == 0)):
+                    temp_fix_match = temp.idxmax()
+                    matched_points = pd.DataFrame(
+                        [[temp_fix_match, i, 1.0, 'Marker']],
+                        columns=Match_df.columns
+                    )
+                    Match_df = pd.concat(
+                        [Match_df, matched_points], ignore_index=True)
+                    j = temp_fix_match
+                    temp_move_match = i
+        
+        # Process matched chunks with integrated cumulative matching
+        it_chunks = Match_df[
+            ((Match_df['FIX_ID'].shift(-1) - Match_df['FIX_ID']) != 1) &
+            ((Match_df['MOVE_ID'].shift(-1) - Match_df['MOVE_ID']) != 1)
+        ]
+        it_chunks2 = it_chunks.head(-1)
+        
+        # Create cumulative matcher if enabled
+        cumulative_matcher = None
+        cumulative_matches = []
+        if use_cumulative_for_unmatched:
+            cumulative_matcher = CumulativeLengthMatcher(
+                length_tolerance=cumulative_tolerance,
+                max_aggregate=cumulative_max_aggregate,
+                min_confidence=cumulative_min_confidence
+            )
+        
+        logger.info("Processing chunks with 3-step matching (Forward → Backward → Cumulative)...")
+        
+        for chunk_idx, i in enumerate(it_chunks2.index):
+            init_fix = it_chunks.loc[i]["FIX_ID"]
+            init_move = it_chunks.loc[i]['MOVE_ID']
+            end_fix = it_chunks.iloc[it_chunks.index.get_loc(i) + 1]['FIX_ID']
+            end_move = it_chunks.iloc[it_chunks.index.get_loc(
+                i) + 1]['MOVE_ID']
+            
+            logger.debug(f"  Chunk {chunk_idx + 1}: Master[{init_fix}:{end_fix}] ↔ Target[{init_move}:{end_move}]")
+            
+            # Step 1: Forward matching (confidence-based)
+            matches, fix_break, move_break = forward_match_check(
+                fix_data, move_data, init_fix, init_move, end_fix, end_move, 1, min_confidence=0.80
+            )
+            Match_df = pd.concat([Match_df, matches])
+            chunk_forward_count = len(matches)
+            
+            # Step 2: Backward matching (confidence-based) if there's a gap
+            chunk_backward_count = 0
+            if (fix_break != end_fix) & (move_break != end_move) & (fix_break is not None):
+                matches2, fix_break2, move_break2 = backward_match_check(
+                    fix_data, move_data, fix_break, move_break, end_fix, end_move, 1, min_confidence=0.80
+                )
+                Match_df = pd.concat([Match_df, matches2])
+                chunk_backward_count = len(matches2)
+                
+                # Step 3: Cumulative matching on unmatched joints in this chunk
+                if cumulative_matcher and fix_break2 is not None and move_break2 is not None:
+                    # Get unmatched joints in this chunk gap
+                    chunk_unmatched_master = fix_data.iloc[fix_break:fix_break2+1].copy()
+                    chunk_unmatched_target = move_data.iloc[move_break:move_break2+1].copy()
+                    
+                    chunk_unmatched_master = chunk_unmatched_master.reset_index(drop=True)
+                    chunk_unmatched_target = chunk_unmatched_target.reset_index(drop=True)
+                    
+                    # Apply cumulative matching to this chunk
+                    m_idx = 0
+                    t_idx = 0
+                    chunk_cumulative_count = 0
+                    
+                    while m_idx < len(chunk_unmatched_master) and t_idx < len(chunk_unmatched_target):
+                        match = cumulative_matcher.match_joint(
+                            chunk_unmatched_master, m_idx,
+                            chunk_unmatched_target, t_idx
+                        )
+                        
+                        if match is not None:
+                            cumulative_matches.append(match)
+                            chunk_cumulative_count += 1
+                            
+                            # Advance indices
+                            m_idx += len(match.master_joints)
+                            t_idx += len(match.target_joints)
+                            
+                            logger.debug(
+                                f"    Cumulative: M{match.master_joints} ↔ T{match.target_joints} "
+                                f"({match.match_type}, conf={match.confidence:.2f})"
+                            )
+                        else:
+                            # No match, advance master only
+                            m_idx += 1
+                    
+                    logger.debug(f"    Chunk {chunk_idx + 1}: Forward={chunk_forward_count}, "
+                               f"Backward={chunk_backward_count}, Cumulative={chunk_cumulative_count}")
+                else:
+                    # Record unmatched chunk for later if cumulative not enabled
+                    if fix_break2 is not None and move_break2 is not None:
+                        unmatch_chunks = pd.DataFrame(
+                            np.array([fix_break, move_break, fix_break2, move_break2]).reshape(1, 4),
+                            columns=Unmatch.columns
+                        )
+                        Unmatch = pd.concat([Unmatch, unmatch_chunks], ignore_index=True)
+        
+        # Match joints before first marker and after last marker
+        try:
+            matches, _, _ = backward_match_check(
+                fix_data, move_data, 0, 0, it_chunks.iloc[0, 0], it_chunks.iloc[0, 1], 1, min_confidence=0.80
+            )
+            Match_df = pd.concat([Match_df, matches])
+        except:
+            pass
+        
+        try:
+            matches, _, _ = forward_match_check(
+                fix_data, move_data, it_chunks.iloc[-1, 0], it_chunks.iloc[-1, 1],
+                int(fix_data.iloc[-1, 0]), int(move_data.iloc[-1, 0]), 1, min_confidence=0.80
+            )
+            Match_df = pd.concat([Match_df, matches])
+        except:
+            pass
+        
+        if Match_df.empty:
+            logger.warning("  No chunks found in marker-based matching")
+        else:
+            Match_df = Match_df.drop_duplicates(["FIX_ID", "MOVE_ID"], keep="first").sort_values(
+                by="FIX_ID", ignore_index=True
+            )
+            logger.info(f"  Marker-based matching (forward/backward) found {len(Match_df)} matches")
+        
+        # Transform output
+        temp_output = pd.merge(
+            pd.merge(Match_df, fix_data, left_on='FIX_ID',
+                     right_index=True, how='left'),
+            move_data, left_on='MOVE_ID', right_index=True, how='left'
+        )
+        
+        if direction == "Reverse" or direction == "REV":
+            temp_output = temp_output.rename(columns={
+                'ili_id_x': 'Master_ili_id',
+                'joint_number_x': 'Master_joint_number',
+                'joint_number_y': 'Alias_joint_number',
+                "joint_number_org": "Target_joint_number",
+                'ili_id_y': 'Target_ili_id',
+                'CONFIDENCE': 'Confidence',
+                'SOURCE': 'Match_Source'
+            })
+            Match_output = temp_output[['Master_ili_id', 'Master_joint_number',
+                                        'Target_joint_number', 'Alias_joint_number', 'Target_ili_id', 'Confidence', 'Match_Source']]
+        else:
+            temp_output = temp_output.rename(columns={
+                'ili_id_x': 'Master_ili_id',
+                'joint_number_x': 'Master_joint_number',
+                'joint_number_y': "Target_joint_number",
+                'ili_id_y': 'Target_ili_id',
+                'CONFIDENCE': 'Confidence',
+                'SOURCE': 'Match_Source'
+            })
+            Match_output = temp_output[[
+                'Master_ili_id', 'Master_joint_number', 'Target_joint_number', 'Target_ili_id', 'Confidence', 'Match_Source']]
+        
+        Match_all = Match_output.reset_index(drop=True)
+        
+        # Handle questionable matches (duplicates)
+        questionable = Match_all[
+            (Match_all["Target_joint_number"].duplicated(keep=False)) |
+            (Match_all["Master_joint_number"].duplicated(keep=False))
+        ]
+        
+        if not questionable.empty:
+            Match_all = Match_all.loc[~Match_all.index.isin(
+                questionable.index)]
+            Match_df = Match_df.loc[~Match_df.index.isin(questionable.index)]
+            logger.warning(f"  Found {len(questionable)} questionable matches from forward/backward matching")
+        
+        # Track matched joints from forward/backward matching
+        forward_backward_matched_master = set(Match_all["Master_joint_number"].astype(str).tolist())
+        forward_backward_matched_target = set(Match_all["Target_joint_number"].astype(str).tolist())
+        
+        logger.info(f"  Forward/Backward matching: {len(forward_backward_matched_master)} master joints matched, "
+                   f"{len(forward_backward_matched_target)} target joints matched")
+        
+        # Transform to output format
+        Match_df["Master_joint_number"] = fix_df.loc[Match_df["FIX_ID"]]["joint_number"].array
+        Match_df["Target_joint_number"] = move_df.loc[Match_df["MOVE_ID"]]["joint_number"].array
+        
+        # Determine unmatched joints from forward/backward matching
+        all_master_joints = set(fix_df["joint_number"].astype(str).tolist())
+        all_target_joints = set(move_df["joint_number"].astype(str).tolist())
+        
+        unmatched_master_from_forward_backward = all_master_joints - forward_backward_matched_master
+        unmatched_target_from_forward_backward = all_target_joints - forward_backward_matched_target
+        
+        logger.info(f"  Unmatched from forward/backward: {len(unmatched_master_from_forward_backward)} master, "
+                   f"{len(unmatched_target_from_forward_backward)} target")
+        
+        # ========== REPORT CUMULATIVE MATCHING RESULTS ==========
+        # Track matched joints from cumulative matching (already done within chunks)
+        final_matched_master = forward_backward_matched_master.copy()
+        final_matched_target = forward_backward_matched_target.copy()
+        
+        if cumulative_matches:
+            for match in cumulative_matches:
+                final_matched_master.update([str(j) for j in match.master_joints])
+                final_matched_target.update([str(j) for j in match.target_joints])
+            
+            logger.info(f"Cumulative matching found {len(cumulative_matches)} additional matches")
+            
+            splits = sum(1 for m in cumulative_matches if m.is_split())
+            merges = sum(1 for m in cumulative_matches if m.is_merge())
+            
+            logger.info(f"  - Splits (1-to-many): {splits}")
+            logger.info(f"  - Merges (many-to-1): {merges}")
+        
+        # ========== MERGE RESULTS ==========
+        logger.info("Merging results from forward/backward matching and cumulative matching...")
+        
+        # Build matched joints DataFrame with all required fields
+        matched_joints_list = []
+        
+        # Add forward/backward matching results (using calculated confidence scores)
+        for _, row in Match_all.iterrows():
+            master_joint_num = int(row['Master_joint_number'])
+            target_joint_num = int(row['Target_joint_number'])
+            
+            master_length = master_length_map.get(master_joint_num, 0)
+            target_length = target_length_map.get(target_joint_num, 0)
+            
+            length_diff = abs(master_length - target_length)
+            avg_length = (master_length + target_length) / 2
+            ratio = (length_diff / avg_length) if avg_length > 0 else 0
+            
+            # Use the confidence score and source from matching
+            confidence = row.get('Confidence', 1.0)  # Default to 1.0 if not present
+            match_source = row.get('Match_Source', 'Unknown')  # Get the source (Marker, Forward, or Backward)
+            
+            matched_joints_list.append({
+                'Master ILI ID': row['Master_ili_id'],
+                'Master Joint Number': master_joint_num,
+                'Master Total Length (m)': round(master_length, 3),
+                'Target Joint Number': target_joint_num,
+                'Target Total Length (m)': round(target_length, 3),
+                'Target ILI ID': row['Target_ili_id'],
+                'Length Difference (m)': round(length_diff, 3),
+                'Length Ratio': round(ratio, 4),
+                'Confidence Score': round(confidence, 3),
+                'Match Source': match_source,
+                'Match Type': '1-to-1'
+            })
+        
+        # Add cumulative matches
+        for match in cumulative_matches:
+            master_joints_str = ','.join(map(str, match.master_joints))
+            target_joints_str = ','.join(map(str, match.target_joints))
+            
+            avg_length = (match.master_total_length + match.target_total_length) / 2
+            ratio = (match.length_difference / avg_length) if avg_length > 0 else 0
+            
+            matched_joints_list.append({
+                'Master ILI ID': fix_ili_id,
+                'Master Joint Number': master_joints_str,
+                'Master Total Length (m)': round(match.master_total_length, 3),
+                'Target Joint Number': target_joints_str,
+                'Target Total Length (m)': round(match.target_total_length, 3),
+                'Target ILI ID': move_ili_id,
+                'Length Difference (m)': round(match.length_difference, 3),
+                'Length Ratio': round(ratio, 4),
+                'Confidence Score': round(match.confidence, 3),
+                'Match Source': 'Cumulative Matching',
+                'Match Type': match.match_type
+            })
+        
+        # Determine final unmatched joints
+        final_unmatched_master = all_master_joints - final_matched_master
+        final_unmatched_target = all_target_joints - final_matched_target
+        
+        # Create integrated list with matched and unmatched joints interleaved
+        integrated_list = []
+        
+        # Sort matched joints by master joint number (handle comma-separated lists)
+        matched_with_sort_key = []
+        for match_row in matched_joints_list:
+            master_joints_str = str(match_row['Master Joint Number'])
+            # Get first master joint number for sorting
+            first_master = int(master_joints_str.split(',')[0]) if ',' in master_joints_str else int(master_joints_str)
+            matched_with_sort_key.append((first_master, match_row))
+        
+        matched_with_sort_key.sort(key=lambda x: x[0])
+        
+        # Track last processed joint numbers
+        last_master_joint = 0
+        last_target_joint = 0
+        
+        for idx, (sort_key, match_row) in enumerate(matched_with_sort_key):
+            master_joints_str = str(match_row['Master Joint Number'])
+            target_joints_str = str(match_row['Target Joint Number'])
+            
+            # Parse master joint range
+            if ',' in master_joints_str:
+                master_joints = [int(j) for j in master_joints_str.split(',')]
+                current_master_start = min(master_joints)
+                current_master_end = max(master_joints)
+            else:
+                current_master_start = int(master_joints_str)
+                current_master_end = int(master_joints_str)
+            
+            # Parse target joint range
+            if ',' in target_joints_str:
+                target_joints = [int(j) for j in target_joints_str.split(',')]
+                current_target_start = min(target_joints)
+                current_target_end = max(target_joints)
+            else:
+                current_target_start = int(target_joints_str)
+                current_target_end = int(target_joints_str)
+            
+            # Add unmatched master joints before this match
+            unmatched_masters_in_gap = [
+                int(j) for j in final_unmatched_master
+                if last_master_joint < int(j) < current_master_start
+            ]
+            for joint_num in sorted(unmatched_masters_in_gap):
+                length = master_length_map.get(joint_num, 0)
+                integrated_list.append({
+                    'Master ILI ID': fix_ili_id,
+                    'Master Joint Number': joint_num,
+                    'Master Total Length (m)': round(length, 3),
+                    'Target Joint Number': '',
+                    'Target Total Length (m)': '',
+                    'Target ILI ID': '',
+                    'Length Difference (m)': '',
+                    'Length Ratio': '',
+                    'Confidence Score': '',
+                    'Match Source': 'Unmatched Master',
+                    'Match Type': 'Unmatched'
+                })
+            
+            # Add unmatched target joints before this match
+            unmatched_targets_in_gap = [
+                int(j) for j in final_unmatched_target
+                if last_target_joint < int(j) < current_target_start
+            ]
+            for joint_num in sorted(unmatched_targets_in_gap):
+                length = target_length_map.get(joint_num, 0)
+                integrated_list.append({
+                    'Master ILI ID': '',
+                    'Master Joint Number': '',
+                    'Master Total Length (m)': '',
+                    'Target Joint Number': joint_num,
+                    'Target Total Length (m)': round(length, 3),
+                    'Target ILI ID': move_ili_id,
+                    'Length Difference (m)': '',
+                    'Length Ratio': '',
+                    'Confidence Score': '',
+                    'Match Source': 'Unmatched Target',
+                    'Match Type': 'Unmatched'
+                })
+            
+            # Add the matched pair
+            integrated_list.append(match_row)
+            
+            # Update last processed positions
+            last_master_joint = current_master_end
+            last_target_joint = current_target_end
+        
+        # Add remaining unmatched joints after the last match
+        remaining_unmatched_masters = [
+            int(j) for j in final_unmatched_master
+            if int(j) > last_master_joint
+        ]
+        for joint_num in sorted(remaining_unmatched_masters):
+            length = master_length_map.get(joint_num, 0)
+            integrated_list.append({
+                'Master ILI ID': fix_ili_id,
+                'Master Joint Number': joint_num,
+                'Master Total Length (m)': round(length, 3),
+                'Target Joint Number': '',
+                'Target Total Length (m)': '',
+                'Target ILI ID': '',
+                'Length Difference (m)': '',
+                'Length Ratio': '',
+                'Confidence Score': '',
+                'Match Source': 'Unmatched Master',
+                'Match Type': 'Unmatched'
+            })
+        
+        remaining_unmatched_targets = [
+            int(j) for j in final_unmatched_target
+            if int(j) > last_target_joint
+        ]
+        for joint_num in sorted(remaining_unmatched_targets):
+            length = target_length_map.get(joint_num, 0)
+            integrated_list.append({
+                'Master ILI ID': '',
+                'Master Joint Number': '',
+                'Master Total Length (m)': '',
+                'Target Joint Number': joint_num,
+                'Target Total Length (m)': round(length, 3),
+                'Target ILI ID': move_ili_id,
+                'Length Difference (m)': '',
+                'Length Ratio': '',
+                'Confidence Score': '',
+                'Match Source': 'Unmatched Target',
+                'Match Type': 'Unmatched'
+            })
+        
+        # Create the integrated matched joints DataFrame (includes both matched and unmatched)
+        matched_joints = pd.DataFrame(integrated_list)
+        
+        # Create separate unmatched joints DataFrame for the Unmatched tab
+        unmatched_joints_list = []
+        for joint_num in sorted([int(j) for j in final_unmatched_master]):
+            length = master_length_map.get(joint_num, 0)
+            unmatched_joints_list.append({
+                'Inspection': 'Master',
+                'ILI ID': fix_ili_id,
+                'Joint Number': joint_num,
+                'Length (m)': round(length, 3)
+            })
+        
+        for joint_num in sorted([int(j) for j in final_unmatched_target]):
+            length = target_length_map.get(joint_num, 0)
+            unmatched_joints_list.append({
+                'Inspection': 'Target',
+                'ILI ID': move_ili_id,
+                'Joint Number': joint_num,
+                'Length (m)': round(length, 3)
+            })
+        
+        unmatched_joints = pd.DataFrame(unmatched_joints_list)
+        
+        # Process questionable joints
+        questionable_joints_list = []
+        if not questionable.empty:
+            for _, row in questionable.iterrows():
+                master_joint_num = int(row['Master_joint_number'])
+                target_joint_num = int(row['Target_joint_number'])
+                
+                master_length = master_length_map.get(master_joint_num, 0)
+                target_length = target_length_map.get(target_joint_num, 0)
+                
+                questionable_joints_list.append({
+                    'Master ILI ID': row['Master_ili_id'],
+                    'Master Joint Number': master_joint_num,
+                    'Master Total Length (m)': round(master_length, 3),
+                    'Target Joint Number': target_joint_num,
+                    'Target Total Length (m)': round(target_length, 3),
+                    'Target ILI ID': row['Target_ili_id'],
+                    'Reason': 'Duplicate'
+                })
+        
+        questionable_df = pd.DataFrame(questionable_joints_list)
+        
+        # Build run summary
+        run_summary = {
+            "Master_inspection_guid": master_guid_tuple[0],
+            "Master_ili_id": fix_ili_id,
+            "Target_inspection_guid": target_guid,
+            "Target_ili_id": move_ili_id,
+            "Total_master_joints": len(fix_df),
+            "Total_target_joints": len(move_df),
+            "Matched_joints": len(matched_joints),
+            "Matched_from_original": len(Match_all),
+            "Matched_from_cumulative": len(cumulative_matches),
+            "Unmatched_joints": len(unmatched_joints),
+            "Questionable_matches": len(questionable),
+            "Master_joint_percentage": round((len(final_matched_master) / len(fix_df)) * 100, 2),
+            "Target_joint_percentage": round((len(final_matched_target) / len(move_df)) * 100, 2),
+            "Flow_direction": direction,
+            "Cumulative_matching_enabled": use_cumulative_for_unmatched
+        }
+        
+        logger.info("=" * 80)
+        logger.info("MATCHING COMPLETE")
+        logger.info("=" * 80)
+        logger.info(f"Total matched: {len(matched_joints)}")
+        logger.info(f"  - From original algorithm: {len(Match_all)}")
+        logger.info(f"  - From cumulative matching: {len(cumulative_matches)}")
+        logger.info(f"Total unmatched: {len(unmatched_joints)}")
+        logger.info(f"Master match rate: {run_summary['Master_joint_percentage']:.2f}%")
+        logger.info(f"Target match rate: {run_summary['Target_joint_percentage']:.2f}%")
+        logger.info("=" * 80)
+        
+        # Export to Excel if output_path provided
+        if output_path:
+            success = export_to_excel(matched_joints, unmatched_joints, run_summary, output_path)
+            if success:
+                logger.info(f"✓ Results exported to: {os.path.abspath(output_path)}")
+        
+        # Convert DataFrames to list of dicts for JSON serialization
+        matched_joints_list = matched_joints.replace({np.nan: None}).to_dict('records')
+        unmatched_joints_list = unmatched_joints.replace({np.nan: None}).to_dict('records')
+        questionable_joints_list = questionable_df.replace({np.nan: None}).to_dict('records')
+        
+        # Store result for this target
+        results_list.append({
+            "run_summary": run_summary,
+            "matched_joints": matched_joints_list,
+            "unmatched_joints": unmatched_joints_list,
+            "questionable_joints": questionable_joints_list
+        })
+        
+        logger.info(f"Completed target {target_guid}")
+    
+    # For simplicity, return the first result (single target for now)
+    if not results_list:
+        raise ValueError("No valid target inspections found")
+    
+    return results_list[0]

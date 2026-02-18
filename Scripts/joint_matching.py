@@ -155,42 +155,58 @@ def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
 
 
 def unchunk_dataframe(unmatched_chunks: pd.DataFrame, fix_df: pd.DataFrame, move_df: pd.DataFrame) -> pd.DataFrame:
-    """Expand master and target joint ranges into individual joints."""
+    """
+    Expand master and target joint ranges into individual joints.
+    
+    Removes duplicates that may occur when chunks overlap or joints appear
+    in multiple unmatched ranges.
+    """
     master_unmatched_joints = pd.DataFrame()
     target_unmatched_joints = pd.DataFrame()
 
     for _, row in unmatched_chunks.iterrows():
-        master_start = int(row['Master_joint_start']) if not pd.isna(
-            row['Master_joint_start']) else np.nan
-        master_end = int(row['Master_joint_end']) if not pd.isna(
-            row['Master_joint_end']) else np.nan
-        target_start = int(row['Target_joint_start']) if not pd.isna(
-            row['Target_joint_start']) else np.nan
-        target_end = int(row['Target_joint_end']) if not pd.isna(
-            row['Target_joint_end']) else np.nan
+        # Safely get values using .get() method with default np.nan
+        master_start = int(row.get('Master_joint_start', np.nan)) if not pd.isna(
+            row.get('Master_joint_start', np.nan)) else np.nan
+        master_end = int(row.get('Master_joint_end', np.nan)) if not pd.isna(
+            row.get('Master_joint_end', np.nan)) else np.nan
+        target_start = int(row.get('Target_joint_start', np.nan)) if not pd.isna(
+            row.get('Target_joint_start', np.nan)) else np.nan
+        target_end = int(row.get('Target_joint_end', np.nan)) if not pd.isna(
+            row.get('Target_joint_end', np.nan)) else np.nan
 
-        if pd.isna(master_end):
-            master_batch = fix_df.loc[(
-                fix_df['joint_number'].astype(int) >= master_start)]
-        else:
-            master_batch = fix_df.loc[
-                ((fix_df['joint_number'].astype(int) >= master_start) &
-                 (fix_df['joint_number'].astype(int) <= master_end))
-            ]
+        # Process master joints if start is valid
+        if not pd.isna(master_start):
+            if pd.isna(master_end):
+                master_batch = fix_df.loc[(
+                    fix_df['joint_number'].astype(int) >= master_start)]
+            else:
+                master_batch = fix_df.loc[
+                    ((fix_df['joint_number'].astype(int) >= master_start) &
+                     (fix_df['joint_number'].astype(int) <= master_end))
+                ]
+            master_unmatched_joints = pd.concat(
+                [master_unmatched_joints, master_batch], ignore_index=True)
 
-        if pd.isna(target_end):
-            target_batch = move_df.loc[(
-                move_df['joint_number'].astype(int) >= target_start)]
-        else:
-            target_batch = move_df.loc[
-                ((move_df['joint_number'].astype(int) >= target_start) &
-                 (move_df['joint_number'].astype(int) <= target_end))
-            ]
+        # Process target joints if start is valid
+        if not pd.isna(target_start):
+            if pd.isna(target_end):
+                target_batch = move_df.loc[(
+                    move_df['joint_number'].astype(int) >= target_start)]
+            else:
+                target_batch = move_df.loc[
+                    ((move_df['joint_number'].astype(int) >= target_start) &
+                     (move_df['joint_number'].astype(int) <= target_end))
+                ]
+            target_unmatched_joints = pd.concat(
+                [target_unmatched_joints, target_batch], ignore_index=True)
 
-        master_unmatched_joints = pd.concat(
-            [master_unmatched_joints, master_batch], ignore_index=True)
-        target_unmatched_joints = pd.concat(
-            [target_unmatched_joints, target_batch], ignore_index=True)
+    # Remove duplicates - joints may appear in multiple unmatched chunk ranges
+    # This can happen due to overlapping ranges or algorithm edge cases
+    master_unmatched_joints = master_unmatched_joints.drop_duplicates(
+        subset=['joint_number'], keep='first')
+    target_unmatched_joints = target_unmatched_joints.drop_duplicates(
+        subset=['joint_number'], keep='first')
 
     all_dfs = []
     for _, row in master_unmatched_joints.iterrows():
@@ -282,74 +298,40 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
     target_guid_list = tuple(target_guids)
     all_guid_list = master_guid_tuple + target_guid_list
 
-    # Build SQL queries with parameterized placeholders
-    joint_query = text("""
-        WITH latest_version AS (
-            SELECT t.version_guid,
-                   t.ili_inspection_guid,
-                   t.version_id,
-                   t.status,
-                   t.rownumber
-            FROM ( SELECT iliv_1.version_guid,
-                          iliv_1.ili_inspection_guid,
-                          iliv_1.version_id,
-                          iliv_1.status,
-                          row_number() OVER (PARTITION BY iliv_1.ili_inspection_guid ORDER BY (replace(iliv_1.version_id::text, 'Version-'::text, ''::text)::INTEGER) DESC) AS rownumber
-                   FROM ilidata.ili_inspection_version_mapping iliv_1) t
-            WHERE t.rownumber = 1 AND t.ili_inspection_guid IN (SELECT unnest(CAST(:guid_list AS text[]))::ulid)
-            )
-        SELECT us_weld_number as joint_number,
-               id.joint_length as joint_length,
-               TO_CHAR(date_collected,'YYYY') as iliyr,
-               insp.ili_inspection_guid as insp_guid,
-               insp.ili_inspection_id as ili_id,
-               id.smys,
-               id.reported_wall_thickness,
-               id.Outside_diameter,
-               id.ili_pipe_length_guid,
-               pl.pipe_segment_guid
-        FROM ilidata.ili_data id
-        JOIN latest_version lv ON lv.ili_inspection_guid = id.ili_inspection_guid
-        INNER JOIN ilidata.ili_inspection insp ON insp.ili_inspection_guid = id.ili_inspection_guid
-        left outer join ilidata.ili_pipe_length pl ON id.ili_pipe_length_guid = pl.ili_pipe_length_guid
-        left outer join ilidata.pipe_segment ps ON pl.pipe_segment_guid = ps.pipe_segment_guid
-        ORDER BY CAST(us_weld_number AS NUMERIC)
+    # Build SQL query with proper filtering, distinct, and ordering
+    placeholders = ','.join([f":guid{i}" for i in range(len(all_guid_list))])
+    joint_query = text(f"""
+        SELECT DISTINCT
+               joint_number,
+               joint_length,
+               iliyr,
+               insp_guid,
+               ili_id
+        FROM public.joints
+        WHERE insp_guid IN ({placeholders})
+        ORDER BY insp_guid, CAST(joint_number AS INTEGER)
     """)
 
-    version_query = text("""
-        SELECT t.version_guid,
-               t.ili_inspection_guid,
-               t.version_id,
-               t.status,
-               t.rownumber
-        FROM ( SELECT iliv_1.version_guid,
-                      iliv_1.ili_inspection_guid,
-                      iliv_1.version_id,
-                      iliv_1.status,
-                      row_number() OVER (PARTITION BY iliv_1.ili_inspection_guid ORDER BY (replace(iliv_1.version_id::text, 'Version-'::text, ''::text)::INTEGER) DESC) AS rownumber
-               FROM ilidata.ili_inspection_version_mapping iliv_1) t
-        WHERE t.rownumber = 1 AND t.ili_inspection_guid IN (SELECT unnest(CAST(:guid_list AS text[]))::ulid)
-    """)
+    # Create parameters dict
+    params = {f'guid{i}': str(guid) for i, guid in enumerate(all_guid_list)}
 
-    # Query database with parameterized queries
+    # Query database
     with engine.connect() as conn:
-        joint_list = pd.read_sql_query(con=conn, sql=joint_query, params={'guid_list': list(all_guid_list)}).drop_duplicates(
-            subset=['joint_number', 'joint_length',
-                    'iliyr', 'insp_guid', 'ili_id'],
-            keep="first"
-        )
-        smaller_subset = ['joint_number',
-                          'joint_length', 'insp_guid', 'ili_id']
-        joint_list = joint_list.dropna(subset=smaller_subset)
-        version_df = pd.read_sql_query(con=conn, sql=version_query, params={
-                                       'guid_list': list(all_guid_list)})
+        joint_list = pd.read_sql_query(con=conn, sql=joint_query, params=params)
+        
+        # Drop null values
+        smaller_subset = ['joint_number', 'joint_length', 'insp_guid', 'ili_id']
+        joint_list = joint_list.dropna(subset=smaller_subset).reset_index(drop=True)
 
     logger.info("Database query successful")
 
-    # Prepare master dataset
+    # Prepare master dataset - filter and ensure proper ordering
     joint_list["insp_guid"] = joint_list["insp_guid"].astype("str")
-    fix_df = joint_list.loc[joint_list["insp_guid"] ==
-                            master_guid_tuple[0]].reset_index(drop=True)
+    fix_df = joint_list.loc[joint_list["insp_guid"] == master_guid_tuple[0]].copy()
+    
+    # Convert joint_number to integer and sort
+    fix_df['joint_number'] = fix_df['joint_number'].astype(int)
+    fix_df = fix_df.sort_values('joint_number').reset_index(drop=True)
 
     if fix_df.empty or fix_df["joint_length"].empty:
         raise ValueError("Master dataset is empty")
@@ -366,8 +348,11 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
     for target_guid in target_guid_list:
         logger.info(f"Processing target: {target_guid}")
 
-        move_df = joint_list.loc[joint_list["insp_guid"]
-                                 == target_guid].reset_index(drop=True)
+        move_df = joint_list.loc[joint_list["insp_guid"] == target_guid].copy()
+        
+        # Convert joint_number to integer and sort
+        move_df['joint_number'] = move_df['joint_number'].astype(int)
+        move_df = move_df.sort_values('joint_number').reset_index(drop=True)
 
         if move_df.empty or move_df["joint_length"].empty:
             logger.warning(f"Target {target_guid} is empty, skipping")
@@ -660,9 +645,14 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
             unmatched_chunks = unmatched_chunks.rename(columns={
                 0: 'FIX_START', 1: 'MOVE_START', 3: 'FIX_END', 4: 'MOVE_END'
             })
+            
+            # Merge in the Unmatch chunks from forward/backward breaks (if any)
+            if not Unmatch.empty:
+                unmatched_chunks = pd.concat([unmatched_chunks, Unmatch], ignore_index=True)
         else:
-            # No matches at all - create empty unmatched_chunks DataFrame
-            unmatched_chunks = pd.DataFrame(columns=['FIX_START', 'MOVE_START', 'FIX_END', 'MOVE_END'])
+            # No matches at all - start with Unmatch chunks (if any)
+            unmatched_chunks = Unmatch.copy() if not Unmatch.empty else pd.DataFrame(
+                columns=['FIX_START', 'MOVE_START', 'FIX_END', 'MOVE_END'])
         
         # Add joints BEFORE first match and AFTER last match (if any)
         if not Mat_pairs_sort.empty:
@@ -732,22 +722,29 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
                 if 0 <= move_end_idx < len(move_df):
                     unmatched_chunks.at[idx, "Target_joint_end"] = move_df.iloc[move_end_idx]["joint_number"]
 
-        unmatched_chunks.drop(
-            ["FIX_START", "FIX_END", "MOVE_START", "MOVE_END"], axis=1, inplace=True)
-        unmatched_chunks = unmatched_chunks[[
-            "Master_joint_start", "Master_joint_end", "Target_joint_start", "Target_joint_end"]]
+        # Drop the index columns if they exist
+        cols_to_drop = [col for col in ["FIX_START", "FIX_END", "MOVE_START", "MOVE_END"] if col in unmatched_chunks.columns]
+        if cols_to_drop:
+            unmatched_chunks.drop(cols_to_drop, axis=1, inplace=True)
+        
+        # Reorder columns, only including those that exist
+        desired_cols = ["Master_joint_start", "Master_joint_end", "Target_joint_start", "Target_joint_end"]
+        existing_cols = [col for col in desired_cols if col in unmatched_chunks.columns]
+        if existing_cols:
+            unmatched_chunks = unmatched_chunks[existing_cols]
 
         # Expand unmatched chunks
         unmatched_joints = unchunk_dataframe(unmatched_chunks, fix_df, move_df)
         
-        # Find unmatched Target joints (not in any match)
+        # Find unmatched Target joints (not in any match AND not already in unmatched_joints)
         if not Match_all.empty:
             matched_target_joints = set(Match_all["Target_joint_number"].dropna().astype(str).tolist())
             all_target_joints = set(move_df["joint_number"].astype(str).tolist())
-            unmatched_target_joints = all_target_joints - matched_target_joints
+            already_unmatched_target = set(unmatched_joints[unmatched_joints["Target_joint_number"] != ""]["Target_joint_number"].astype(str).tolist())
+            unmatched_target_joints = all_target_joints - matched_target_joints - already_unmatched_target
             
             if unmatched_target_joints:
-                # Add unmatched Target joints to unmatched_joints
+                # Add any remaining unmatched Target joints not already in unmatched_joints
                 for target_joint in unmatched_target_joints:
                     unmatched_joints = pd.concat([
                         unmatched_joints,
@@ -757,8 +754,7 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
         # Prepare final output DataFrames
         rename_map = {
             "Master_joint_number": "Master Joint Number",
-            "Target_joint_number": "Target Joint Number",
-            "Pipe_segment_guid": "Pipe Segment Guid"
+            "Target_joint_number": "Target Joint Number"
         }
 
         # Process questionable joints
@@ -766,19 +762,8 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
             questionable = questionable.drop_duplicates(
                 subset=['Master_joint_number', 'Target_joint_number'], keep='first'
             )
-            # Merge with move_df to get Target segment guid for questionable joints
-            questionable = pd.merge(questionable, move_df[['joint_number', 'pipe_segment_guid']], 
-                                   left_on='Target_joint_number', right_on='joint_number', how='left')
-            
-            # For questionable joints: Use Target segment guid only if target exists, otherwise NULL
-            # If only Master_joint_number exists (no Target_joint_number) -> NULL
-            questionable['Pipe_segment_guid'] = questionable.apply(
-                lambda row: row['pipe_segment_guid'] if pd.notna(row.get('Target_joint_number')) and row.get('Target_joint_number') != '' else None,
-                axis=1
-            )
             
             questionable.rename(columns=rename_map, inplace=True)
-            questionable = clean_column_none_to_null(questionable, "Pipe Segment Guid")
 
         # Merge matched joints with additional data
         matched_joints = pd.merge(Match_all, Match_df, on=[
@@ -786,65 +771,14 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
         matched_joints = matched_joints.rename(
             columns={'STATUS': 'Iterations'})
         matched_joints.rename(columns=rename_map, inplace=True)
-        matched_joints = pd.merge(
-            matched_joints, move_df, left_on='Target Joint Number', right_on='joint_number', how='inner')
-        matched_joints = pd.merge(matched_joints, fix_df, left_on='Master Joint Number', right_on='joint_number',
-                                  how='inner', suffixes=('_target', '_master'))
 
-        rename_some_joints = {
-            "reported_wall_thickness_master": "Master Wall Thickness",
-            "outside_diameter_master": "Master Outside Diameter",
-            "pipe_segment_guid_target": "Pipe Segment Guid",  # Use Target segment guid for matched joints
-            "smys_master": "Master Smys",
-            "ili_pipe_length_guid_master": "Master Pipe Length Guid",
-        }
-        matched_joints.rename(columns=rename_some_joints, inplace=True)
-        matched_joints = clean_column_none_to_null(
-            matched_joints, "Pipe Segment Guid")
-
-        # Merge unmatched joints
-        unmatched_joints = pd.merge(unmatched_joints, fix_df, left_on='Master_joint_number',
-                                    right_on='joint_number', how='left')
-        unmatched_joints = pd.merge(unmatched_joints, move_df, left_on='Target_joint_number',
-                                    right_on='joint_number', how='left', suffixes=('_master', '_target'))
-        
-        # Rename columns for unmatched joints
-        rename_unmatched_joints = {
-            "reported_wall_thickness_master": "Master Wall Thickness",
-            "outside_diameter_master": "Master Outside Diameter",
-            "smys_master": "Master Smys",
-            "ili_pipe_length_guid_master": "Master Pipe Length Guid",
-        }
-        unmatched_joints.rename(columns=rename_unmatched_joints, inplace=True)
         unmatched_joints.rename(columns=rename_map, inplace=True)
-        
-        # For unmatched joints: Use Target segment guid if target exists, otherwise NULL
-        # If Master_joint_number has value but Target_joint_number is empty -> NULL
-        # If Target_joint_number has value -> use pipe_segment_guid_target
-        if 'pipe_segment_guid_target' in unmatched_joints.columns:
-            unmatched_joints['Pipe Segment Guid'] = unmatched_joints.apply(
-                lambda row: row['pipe_segment_guid_target'] if pd.notna(row.get('Target Joint Number')) and row.get('Target Joint Number') != '' else None,
-                axis=1
-            )
-        else:
-            unmatched_joints['Pipe Segment Guid'] = None
-            
-        unmatched_joints = unmatched_joints[[
-            "Master Wall Thickness", "Master Outside Diameter", "Pipe Segment Guid",
-            "Master Smys", "Master Pipe Length Guid", "Master Joint Number", "Target Joint Number"
-        ]]
-        unmatched_joints = clean_column_none_to_null(
-            unmatched_joints, "Pipe Segment Guid")
-        unmatched_joints = clean_column_none_to_null(
-            unmatched_joints, "Master Pipe Length Guid")
 
         # Build run summary
         run_summary = {
             "Master_inspection_guid": master_guid_tuple[0],
             "Master_ili_id": fix_ili_id,
-            "Master_version_id": str(version_df[version_df['ili_inspection_guid'] == master_guid]['version_id'].iloc[0]),
             "Target_inspection_guid": target_guid,
-            "Target_version_id": str(version_df[version_df['ili_inspection_guid'] == target_guid]['version_id'].iloc[0]),
             "Target_ili_id": move_ili_id,
             "Total_master_joints": len(fix_df),
             "Total_target_joints": len(move_df),
