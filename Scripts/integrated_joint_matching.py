@@ -499,7 +499,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                ili_id
         FROM public.joints
         WHERE insp_guid IN ({placeholders})
-        ORDER BY insp_guid, CAST(joint_number AS INTEGER)
+        ORDER BY insp_guid, joint_number
     """)
     
     # Create parameters dict
@@ -1179,10 +1179,15 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         logger.info("=" * 80)
         
         # Export to Excel if output_path provided
+        export_success = None
+        exported_output_path = None
         if output_path:
-            success = export_to_excel(matched_joints, unmatched_joints, run_summary, output_path)
-            if success:
-                logger.info(f"✓ Results exported to: {os.path.abspath(output_path)}")
+            export_success = export_to_excel(matched_joints, unmatched_joints, run_summary, output_path)
+            exported_output_path = os.path.abspath(output_path)
+            if export_success:
+                logger.info(f"✓ Results exported to: {exported_output_path}")
+            else:
+                logger.error(f"✗ Results were not exported to: {exported_output_path}")
         
         # Convert DataFrames to list of dicts for JSON serialization
         matched_joints_list = matched_joints.replace({np.nan: None}).to_dict('records')
@@ -1194,7 +1199,9 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
             "run_summary": run_summary,
             "matched_joints": matched_joints_list,
             "unmatched_joints": unmatched_joints_list,
-            "questionable_joints": questionable_joints_list
+            "questionable_joints": questionable_joints_list,
+            "export_success": export_success,
+            "output_path": exported_output_path
         })
         
         logger.info(f"Completed target {target_guid}")

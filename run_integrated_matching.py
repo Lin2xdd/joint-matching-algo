@@ -46,7 +46,7 @@ def main():
     TARGET_GUIDS = ["a3f5c2e1-7b9d-4f8c-9e2a-b1d6c4f7e2a9"]
     
     # Output file path
-    OUTPUT_PATH = "integrated_matching_results.xlsx"
+    OUTPUT_PATH = r"D:\Github Projects\joint-matching-algo\joint-matching-algo\Sample Output\integrated_matching_results.xlsx"
     
     # Cumulative matching parameters
     USE_CUMULATIVE = True  # Set to False to disable cumulative matching
