@@ -39,7 +39,7 @@ from joint_matching import (
 logger = logging.getLogger(__name__)
 
 
-def _calculate_confidence(length1: float, length2: float, tolerance: float = 0.10) -> float:
+def _calculate_confidence(length1: float, length2: float, tolerance: float = 0.20) -> float:
     """Calculate confidence score for a length match."""
     if length1 <= 0 or length2 <= 0:
         return 0.0
@@ -54,13 +54,69 @@ def _calculate_confidence(length1: float, length2: float, tolerance: float = 0.1
     return max(0.0, min(1.0, confidence))
 
 
+def _is_length_within_tolerance(length1: float, length2: float, tolerance: float = 0.20) -> bool:
+    """Check if two lengths are within percentage tolerance."""
+    if length1 <= 0 or length2 <= 0:
+        return False
+
+    avg_length = (length1 + length2) / 2
+    diff = abs(length1 - length2)
+    diff_ratio = diff / avg_length
+    return diff_ratio <= tolerance
+
+
+def _evaluate_match_quality(length1: float,
+                           length2: float,
+                           confidence_threshold: float = 0.60,
+                           tolerance: float = 0.20) -> Tuple[bool, float, str]:
+    """
+    Determine match acceptance and confidence tier.
+
+    Rules:
+    a) confidence > threshold -> accepted as high confidence
+    b) else if length ratio within tolerance -> accepted as mid confidence
+    c) else rejected
+
+    Returns:
+        (accepted, score_to_store, tier)
+        tier in {'high', 'mid', 'reject'}
+    """
+    confidence = _calculate_confidence(length1, length2, tolerance=tolerance)
+
+    if confidence > confidence_threshold:
+        return True, confidence, 'high'
+
+    if _is_length_within_tolerance(length1, length2, tolerance=tolerance):
+        # Accepted by tolerance fallback; store as mid confidence floor.
+        return True, confidence_threshold, 'mid'
+
+    return False, confidence, 'reject'
+
+
+def _confidence_level_from_score(confidence_score, match_source: str = '') -> str:
+    """Map numeric confidence score to a level label for reporting."""
+    if match_source == 'Unmatched Master' or match_source == 'Unmatched Target':
+        return ''
+    if match_source == 'Marker':
+        return 'High'
+
+    try:
+        score = float(confidence_score)
+    except (TypeError, ValueError):
+        return ''
+
+    return 'High' if score > 0.60 else 'Mid'
+
+
 def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
                         init_fix: int, init_move: int,
                         end_fix: int, end_move: int,
-                        threshold: float, min_confidence: float = 0.80) -> Tuple[pd.DataFrame, int, int]:
+                        threshold: float, min_confidence: float = 0.60) -> Tuple[pd.DataFrame, int, int]:
     """
-    Forward match check function with confidence-based filtering.
-    Only matches joints with confidence >= min_confidence.
+    Forward match check function with confidence + tolerance fallback:
+      a) confidence > min_confidence -> high confidence match
+      b) else if within length tolerance -> mid confidence match
+      c) else reject
     
     Args:
         fix: Master dataframe
@@ -70,7 +126,7 @@ def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
         end_fix: Ending index in master
         end_move: Ending index in target
         threshold: Length difference threshold (legacy parameter, kept for compatibility)
-        min_confidence: Minimum confidence score to accept a match (default 0.80)
+        min_confidence: High-confidence threshold (default 0.60)
     
     Returns:
         Tuple of (matched_pairs DataFrame, fix_break_loc, move_break_loc)
@@ -83,38 +139,39 @@ def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
     for i in range(min_move + 1):
         pair1_len_fix = fix.iloc[init_fix + i]['joint_length']
         pair1_len_move = move.iloc[init_move + i]['joint_length']
-        pair1_confidence = _calculate_confidence(pair1_len_fix, pair1_len_move)
+        pair1_accept, pair1_score, _ = _evaluate_match_quality(
+            pair1_len_fix, pair1_len_move, confidence_threshold=min_confidence, tolerance=0.20
+        )
         
         try:
             pair2_len_fix = fix.iloc[init_fix + i + 1]['joint_length']
             pair2_len_move = move.iloc[init_move + i + 1]['joint_length']
-            pair2_confidence = _calculate_confidence(pair2_len_fix, pair2_len_move)
+            pair2_accept, _, _ = _evaluate_match_quality(
+                pair2_len_fix, pair2_len_move, confidence_threshold=min_confidence, tolerance=0.20
+            )
         except:
-            pair2_confidence = 0.0
+            pair2_accept = False
             
         try:
             pair3_len_fix = fix.iloc[init_fix + i + 2]['joint_length']
             pair3_len_move = move.iloc[init_move + i + 2]['joint_length']
-            pair3_confidence = _calculate_confidence(pair3_len_fix, pair3_len_move)
+            pair3_accept, _, _ = _evaluate_match_quality(
+                pair3_len_fix, pair3_len_move, confidence_threshold=min_confidence, tolerance=0.20
+            )
         except:
-            pair3_confidence = 0.0
+            pair3_accept = False
 
-        # Only match if confidence meets threshold
-        if pair1_confidence >= min_confidence:
+        if pair1_accept:
             matched_points = pd.DataFrame(
-                [[i + init_fix, i + init_move, pair1_confidence, 'Forward']],
+                [[i + init_fix, i + init_move, pair1_score, 'Forward']],
                 columns=matched_pairs.columns
             )
             matched_pairs = pd.concat(
                 [matched_pairs, matched_points], ignore_index=True)
-        elif (pair1_confidence < min_confidence) & (pair2_confidence >= min_confidence) & (pair3_confidence >= min_confidence):
-            # Skip this joint but continue if next two are confident
-            matched_points = pd.DataFrame(
-                [[i + init_fix, i + init_move, pair1_confidence, 'Forward']],
-                columns=matched_pairs.columns
-            )
-            matched_pairs = pd.concat(
-                [matched_pairs, matched_points], ignore_index=True)
+        elif (not pair1_accept) and pair2_accept and pair3_accept:
+            # Skip this joint but continue if next two are confident.
+            # Do NOT append a low-confidence pair as a match record.
+            continue
         else:
             fix_break_loc = i + init_fix
             move_break_loc = i + init_move
@@ -126,10 +183,12 @@ def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
 def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
                          init_fix: int, init_move: int,
                          end_fix: int, end_move: int,
-                         threshold: float, min_confidence: float = 0.80) -> Tuple[pd.DataFrame, int, int]:
+                         threshold: float, min_confidence: float = 0.60) -> Tuple[pd.DataFrame, int, int]:
     """
-    Backward match check function with confidence-based filtering.
-    Only matches joints with confidence >= min_confidence.
+    Backward match check function with confidence + tolerance fallback:
+      a) confidence > min_confidence -> high confidence match
+      b) else if within length tolerance -> mid confidence match
+      c) else reject
     
     Args:
         fix: Master dataframe
@@ -139,7 +198,7 @@ def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
         end_fix: Ending index in master
         end_move: Ending index in target
         threshold: Length difference threshold (legacy parameter, kept for compatibility)
-        min_confidence: Minimum confidence score to accept a match (default 0.80)
+        min_confidence: High-confidence threshold (default 0.60)
     
     Returns:
         Tuple of (matched_pairs DataFrame, fix_break_loc, move_break_loc)
@@ -152,31 +211,33 @@ def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
     for i in range(1, min_move + 1):
         pair1_len_fix = fix.iloc[end_fix - i]['joint_length']
         pair1_len_move = move.iloc[end_move - i]['joint_length']
-        pair1_confidence = _calculate_confidence(pair1_len_fix, pair1_len_move)
+        pair1_accept, pair1_score, _ = _evaluate_match_quality(
+            pair1_len_fix, pair1_len_move, confidence_threshold=min_confidence, tolerance=0.20
+        )
         
         pair2_len_fix = fix.iloc[end_fix - i - 1]['joint_length']
         pair2_len_move = move.iloc[end_move - i - 1]['joint_length']
-        pair2_confidence = _calculate_confidence(pair2_len_fix, pair2_len_move)
+        pair2_accept, _, _ = _evaluate_match_quality(
+            pair2_len_fix, pair2_len_move, confidence_threshold=min_confidence, tolerance=0.20
+        )
         
         pair3_len_fix = fix.iloc[end_fix - i - 2]['joint_length']
         pair3_len_move = move.iloc[end_move - i - 2]['joint_length']
-        pair3_confidence = _calculate_confidence(pair3_len_fix, pair3_len_move)
+        pair3_accept, _, _ = _evaluate_match_quality(
+            pair3_len_fix, pair3_len_move, confidence_threshold=min_confidence, tolerance=0.20
+        )
 
-        # Only match if confidence meets threshold
-        if pair1_confidence >= min_confidence:
+        if pair1_accept:
             matched_points = pd.DataFrame(
-                [[end_fix - i, end_move - i, pair1_confidence, 'Backward']],
+                [[end_fix - i, end_move - i, pair1_score, 'Backward']],
                 columns=matched_pairs.columns
             )
             matched_pairs = pd.concat(
                 [matched_pairs, matched_points], ignore_index=True)
-        elif (pair1_confidence < min_confidence) & (pair2_confidence >= min_confidence) & (pair3_confidence >= min_confidence):
-            matched_points = pd.DataFrame(
-                [[end_fix - i, end_move - i, pair1_confidence, 'Backward']],
-                columns=matched_pairs.columns
-            )
-            matched_pairs = pd.concat(
-                [matched_pairs, matched_points], ignore_index=True)
+        elif (not pair1_accept) and pair2_accept and pair3_accept:
+            # Skip this joint but continue if next two are confident.
+            # Do NOT append a low-confidence pair as a match record.
+            continue
         else:
             fix_break_loc = end_fix - i
             move_break_loc = end_move - i
@@ -216,14 +277,14 @@ class CumulativeLengthMatcher:
     """
     
     def __init__(self, 
-                 length_tolerance: float = 0.10,
+                 length_tolerance: float = 0.20,
                  max_aggregate: int = 5,
                  min_confidence: float = 0.60):
         """
         Initialize the cumulative length matcher.
         
         Args:
-            length_tolerance: Percentage tolerance for length matching (default 10%)
+            length_tolerance: Percentage tolerance for length matching (default 20%)
             max_aggregate: Maximum number of joints to aggregate (default 5)
             min_confidence: Minimum confidence to accept a match (default 0.60)
         """
@@ -286,6 +347,25 @@ class CumulativeLengthMatcher:
         master_joint = master_df.iloc[m_idx]
         target_joint = target_df.iloc[t_idx]
         
+        # Try 1-to-1 first with the same decision policy used by forward/backward.
+        # a) confidence > 60% -> high, b) else within 20% tolerance -> mid, else reject.
+        pair_accept, pair_score, _ = _evaluate_match_quality(
+            master_joint['joint_length'],
+            target_joint['joint_length'],
+            confidence_threshold=self.min_confidence,
+            tolerance=self.length_tolerance
+        )
+        if pair_accept:
+            return JointMatch(
+                master_joints=[int(master_joint['joint_number'])],
+                target_joints=[int(target_joint['joint_number'])],
+                match_type='1-to-1',
+                confidence=pair_score,
+                master_total_length=master_joint['joint_length'],
+                target_total_length=target_joint['joint_length'],
+                length_difference=abs(master_joint['joint_length'] - target_joint['joint_length'])
+            )
+
         # Try 1-to-many (master joint was split into multiple target joints)
         cumulative_target = 0
         target_joints_list = []
@@ -308,12 +388,14 @@ class CumulativeLengthMatcher:
                 split_penalty = 0.05 * (t_count - 1)
                 confidence = max(base_confidence - split_penalty, 0.0)
                 
-                if confidence >= self.min_confidence:
+                # Keep existing 1-to-many behavior, but allow tolerance fallback as mid confidence
+                # when confidence is <= threshold.
+                if confidence > self.min_confidence or self._is_length_match(master_joint['joint_length'], cumulative_target):
                     return JointMatch(
                         master_joints=[int(master_joint['joint_number'])],
                         target_joints=target_joints_list.copy(),
                         match_type=f'1-to-{t_count}',
-                        confidence=confidence,
+                        confidence=confidence if confidence > self.min_confidence else self.min_confidence,
                         master_total_length=master_joint['joint_length'],
                         target_total_length=cumulative_target,
                         length_difference=abs(master_joint['joint_length'] - 
@@ -341,12 +423,14 @@ class CumulativeLengthMatcher:
                 merge_penalty = 0.05 * (m_count - 1)
                 confidence = max(base_confidence - merge_penalty, 0.0)
                 
-                if confidence >= self.min_confidence:
+                # Keep existing many-to-1 behavior, but allow tolerance fallback as mid confidence
+                # when confidence is <= threshold.
+                if confidence > self.min_confidence or self._is_length_match(cumulative_master, target_joint['joint_length']):
                     return JointMatch(
                         master_joints=master_joints_list.copy(),
                         target_joints=[int(target_joint['joint_number'])],
                         match_type=f'{m_count}-to-1',
-                        confidence=confidence,
+                        confidence=confidence if confidence > self.min_confidence else self.min_confidence,
                         master_total_length=cumulative_master,
                         target_total_length=target_joint['joint_length'],
                         length_difference=abs(cumulative_master - 
@@ -451,7 +535,7 @@ def export_to_excel(matched_joints: pd.DataFrame,
 def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_guids: List[str],
                                       output_path: Optional[str] = None,
                                       use_cumulative_for_unmatched: bool = True,
-                                      cumulative_tolerance: float = 0.10,
+                                      cumulative_tolerance: float = 0.20,
                                       cumulative_max_aggregate: int = 5,
                                       cumulative_min_confidence: float = 0.60) -> Dict:
     """
@@ -470,7 +554,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         target_guids: List of target inspection GUIDs
         output_path: Path to output Excel file (optional)
         use_cumulative_for_unmatched: Apply cumulative matching to unmatched joints
-        cumulative_tolerance: Length tolerance for cumulative matching (default 10%)
+        cumulative_tolerance: Length tolerance for cumulative matching (default 20%)
         cumulative_max_aggregate: Max joints to aggregate in cumulative matching
         cumulative_min_confidence: Min confidence for cumulative matching
     
@@ -786,8 +870,20 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                                 f"({match.match_type}, conf={match.confidence:.2f})"
                             )
                         else:
-                            # No match, advance master only
-                            m_idx += 1
+                            # No direct match. Try shifting target by one to recover alignment
+                            # before giving up on this master joint.
+                            shifted_match = None
+                            if t_idx + 1 < len(chunk_unmatched_target):
+                                shifted_match = cumulative_matcher.match_joint(
+                                    chunk_unmatched_master, m_idx,
+                                    chunk_unmatched_target, t_idx + 1
+                                )
+
+                            if shifted_match is not None:
+                                t_idx += 1
+                            else:
+                                # Fall back to advancing master.
+                                m_idx += 1
                     
                     logger.debug(f"    Chunk {chunk_idx + 1}: Forward={chunk_forward_count}, "
                                f"Backward={chunk_backward_count}, Cumulative={chunk_cumulative_count}")
@@ -942,6 +1038,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 'Length Difference (m)': round(length_diff, 3),
                 'Length Ratio': round(ratio, 4),
                 'Confidence Score': round(confidence, 3),
+                'Confidence Level': _confidence_level_from_score(round(confidence, 3), match_source),
                 'Match Source': match_source,
                 'Match Type': '1-to-1'
             })
@@ -964,6 +1061,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 'Length Difference (m)': round(match.length_difference, 3),
                 'Length Ratio': round(ratio, 4),
                 'Confidence Score': round(match.confidence, 3),
+                'Confidence Level': _confidence_level_from_score(round(match.confidence, 3), 'Cumulative Matching'),
                 'Match Source': 'Cumulative Matching',
                 'Match Type': match.match_type
             })
@@ -1028,6 +1126,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                     'Length Difference (m)': '',
                     'Length Ratio': '',
                     'Confidence Score': '',
+                    'Confidence Level': '',
                     'Match Source': 'Unmatched Master',
                     'Match Type': 'Unmatched'
                 })
@@ -1049,6 +1148,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                     'Length Difference (m)': '',
                     'Length Ratio': '',
                     'Confidence Score': '',
+                    'Confidence Level': '',
                     'Match Source': 'Unmatched Target',
                     'Match Type': 'Unmatched'
                 })
@@ -1077,6 +1177,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 'Length Difference (m)': '',
                 'Length Ratio': '',
                 'Confidence Score': '',
+                'Confidence Level': '',
                 'Match Source': 'Unmatched Master',
                 'Match Type': 'Unmatched'
             })
@@ -1097,6 +1198,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 'Length Difference (m)': '',
                 'Length Ratio': '',
                 'Confidence Score': '',
+                'Confidence Level': '',
                 'Match Source': 'Unmatched Target',
                 'Match Type': 'Unmatched'
             })

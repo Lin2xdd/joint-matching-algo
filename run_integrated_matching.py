@@ -50,7 +50,7 @@ def main():
     
     # Cumulative matching parameters
     USE_CUMULATIVE = True  # Set to False to disable cumulative matching
-    CUMULATIVE_TOLERANCE = 0.10  # 10% length tolerance
+    CUMULATIVE_TOLERANCE = 0.20  # 20% length tolerance
     CUMULATIVE_MAX_AGGREGATE = 5  # Max joints to combine
     CUMULATIVE_MIN_CONFIDENCE = 0.60  # Minimum confidence score
     
@@ -86,6 +86,13 @@ def main():
             cumulative_min_confidence=CUMULATIVE_MIN_CONFIDENCE
         )
         
+        # Validate export status when output path is provided
+        export_success = result.get('export_success')
+        exported_output_path = result.get('output_path', OUTPUT_PATH)
+        if OUTPUT_PATH and export_success is False:
+            logger.error(f"✗ Export failed. No file was created at: {exported_output_path}")
+            return 1
+
         # Display summary
         summary = result['run_summary']
         logger.info("")
@@ -108,7 +115,11 @@ def main():
         logger.info(f"")
         logger.info(f"Flow Direction: {summary['Flow_direction']}")
         logger.info("=" * 80)
-        logger.info(f"✓ Results saved to: {OUTPUT_PATH}")
+        if OUTPUT_PATH:
+            if export_success is True:
+                logger.info(f"✓ Results saved to: {exported_output_path}")
+            elif export_success is None:
+                logger.warning(f"Output path was configured but export status was not returned. Path: {OUTPUT_PATH}")
         logger.info("=" * 80)
         
         return 0
