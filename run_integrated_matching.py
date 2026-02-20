@@ -42,8 +42,8 @@ def main():
     }
     
     # Inspection GUIDs
-    MASTER_GUID = "f7e2c9d5-8a4b-4e1f-b3c6-d8a2e7f1c5b4"
-    TARGET_GUIDS = ["a3f5c2e1-7b9d-4f8c-9e2a-b1d6c4f7e2a9"]
+    MASTER_GUID = "f3a7c2d1-8e4b-4f09-a6d3-1b5e9c027f84"
+    TARGET_GUIDS = ["9d062ab4-3c71-4e88-b251-7a4f83e60d19"]
     
     # Output file path
     OUTPUT_PATH = r"D:\Github Projects\joint-matching-algo\joint-matching-algo\Sample Output\integrated_matching_results.xlsx"

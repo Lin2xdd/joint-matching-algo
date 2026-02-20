@@ -76,6 +76,63 @@ CUMULATIVE_MIN_CONFIDENCE = 0.60   # Minimum confidence
 - **Match Source**: "Original Algorithm" or "Cumulative Matching"
 - **Match Type**: "1-to-1", "1-to-2", "2-to-1", etc.
 
+## Confidence vs Length-Difference Ratio Chart
+
+Confidence is computed from ratio using:
+
+```text
+confidence = 1 - (length_ratio_diff / tolerance)
+length_ratio_diff = (1 - confidence) * tolerance
+```
+
+Where `length_ratio_diff = abs(L1 - L2) / ((L1 + L2) / 2)`.
+
+### Current system (tolerance = 20% = 0.20)
+
+| Confidence Score | Length Ratio Diff |
+|---|---:|
+| 100% (1.00) | 0.00 |
+| 90% (0.90) | 0.02 |
+| 80% (0.80) | 0.04 |
+| 70% (0.70) | 0.06 |
+| 60% (0.60) | 0.08 |
+| 50% (0.50) | 0.10 |
+| 40% (0.40) | 0.12 |
+| 30% (0.30) | 0.14 |
+| 20% (0.20) | 0.16 |
+| 10% (0.10) | 0.18 |
+| 0% (0.00) | 0.20 |
+
+### Note on the `60% -> 0.04` example
+
+That mapping is true when tolerance is **10%** (`0.10`):
+
+`length_ratio_diff = (1 - 0.60) * 0.10 = 0.04`
+
+With the updated **20%** tolerance, `60%` corresponds to `0.08`.
+
+## Typical Pipe Joint Length Reference
+
+Confidence classes used below:
+- `High`: confidence `> 0.60` ⇒ `length_ratio_diff < 0.08`
+- `Low`: confidence `<= 0.60` and accepted by tolerance ⇒ `0.08 <= length_ratio_diff <= 0.20`
+
+Range formula for a nominal joint length `L` and ratio limit `r`:
+- `T_min = L * (2 - r) / (2 + r)`
+- `T_max = L * (2 + r) / (2 - r)`
+
+| Pipe Material | Typical Joint Length(s) | High Confidence Match Length Range (m) | Low Confidence Match Length Range (m) |
+|---|---|---|---|
+| Carbon steel | 6 m (SRL), 12 m (DRL) | 6 m: 5.538–6.500; 12 m: 11.077–13.000 | 6 m: 4.909–7.333; 12 m: 9.818–14.667 |
+| Stainless steel | 6 m | 5.538–6.500 | 4.909–7.333 |
+| Ductile iron | 5.5–6 m | 5.5 m: 5.077–5.958; 6 m: 5.538–6.500 | 5.5 m: 4.500–6.722; 6 m: 4.909–7.333 |
+| Cast iron | 3–4 m | 3 m: 2.769–3.250; 4 m: 3.692–4.333 | 3 m: 2.455–3.667; 4 m: 3.273–4.889 |
+| Concrete | 2.5–4 m | 2.5 m: 2.308–2.708; 4 m: 3.692–4.333 | 2.5 m: 2.045–3.056; 4 m: 3.273–4.889 |
+| PVC | 6 m | 5.538–6.500 | 4.909–7.333 |
+| HDPE | 6 m, 12 m, coils | 6 m: 5.538–6.500; 12 m: 11.077–13.000 | 6 m: 4.909–7.333; 12 m: 9.818–14.667 |
+| GRE / GRP | 6–12 m | 6 m: 5.538–6.500; 12 m: 11.077–13.000 | 6 m: 4.909–7.333; 12 m: 9.818–14.667 |
+| Copper | 6 m | 5.538–6.500 | 4.909–7.333 |
+
 ## Implemented Fixes
 
 1. **Skip-branch recording fix (forward/backward)**
