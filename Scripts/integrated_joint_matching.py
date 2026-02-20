@@ -74,12 +74,12 @@ def _evaluate_match_quality(length1: float,
 
     Rules:
     a) confidence > threshold -> accepted as high confidence
-    b) else if length ratio within tolerance -> accepted as mid confidence
+    b) else if length ratio within tolerance -> accepted as low confidence
     c) else rejected
 
     Returns:
         (accepted, score_to_store, tier)
-        tier in {'high', 'mid', 'reject'}
+        tier in {'high', 'low', 'reject'}
     """
     confidence = _calculate_confidence(length1, length2, tolerance=tolerance)
 
@@ -87,8 +87,8 @@ def _evaluate_match_quality(length1: float,
         return True, confidence, 'high'
 
     if _is_length_within_tolerance(length1, length2, tolerance=tolerance):
-        # Accepted by tolerance fallback; store as mid confidence floor.
-        return True, confidence_threshold, 'mid'
+        # Accepted by tolerance fallback; store as low confidence floor.
+        return True, confidence_threshold, 'low'
 
     return False, confidence, 'reject'
 
@@ -105,7 +105,7 @@ def _confidence_level_from_score(confidence_score, match_source: str = '') -> st
     except (TypeError, ValueError):
         return ''
 
-    return 'High' if score > 0.60 else 'Mid'
+    return 'High' if score > 0.60 else 'Low'
 
 
 def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
@@ -899,18 +899,63 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         # Match joints before first marker and after last marker
         try:
             matches, _, _ = backward_match_check(
-                fix_data, move_data, 0, 0, it_chunks.iloc[0, 0], it_chunks.iloc[0, 1], 1, min_confidence=0.80
+                fix_data, move_data, 0, 0, it_chunks.iloc[0, 0], it_chunks.iloc[0, 1], 1, min_confidence=0.60
             )
             Match_df = pd.concat([Match_df, matches])
         except:
             pass
         
         try:
-            matches, _, _ = forward_match_check(
-                fix_data, move_data, it_chunks.iloc[-1, 0], it_chunks.iloc[-1, 1],
-                int(fix_data.iloc[-1, 0]), int(move_data.iloc[-1, 0]), 1, min_confidence=0.80
+            # Process after-last-marker block with full Forward -> Backward -> Cumulative pipeline
+            tail_init_fix = int(it_chunks.iloc[-1, 0])
+            tail_init_move = int(it_chunks.iloc[-1, 1])
+            tail_end_fix = len(fix_data) - 1
+            tail_end_move = len(move_data) - 1
+
+            matches_tail_fwd, tail_fix_break, tail_move_break = forward_match_check(
+                fix_data, move_data,
+                tail_init_fix, tail_init_move,
+                tail_end_fix, tail_end_move,
+                1, min_confidence=0.60
             )
-            Match_df = pd.concat([Match_df, matches])
+            Match_df = pd.concat([Match_df, matches_tail_fwd])
+
+            if (tail_fix_break != tail_end_fix) & (tail_move_break != tail_end_move) & (tail_fix_break is not None):
+                matches_tail_bwd, tail_fix_break2, tail_move_break2 = backward_match_check(
+                    fix_data, move_data,
+                    tail_fix_break, tail_move_break,
+                    tail_end_fix, tail_end_move,
+                    1, min_confidence=0.60
+                )
+                Match_df = pd.concat([Match_df, matches_tail_bwd])
+
+                if cumulative_matcher and tail_fix_break2 is not None and tail_move_break2 is not None:
+                    tail_unmatched_master = fix_data.iloc[tail_fix_break:tail_fix_break2+1].copy().reset_index(drop=True)
+                    tail_unmatched_target = move_data.iloc[tail_move_break:tail_move_break2+1].copy().reset_index(drop=True)
+
+                    m_idx = 0
+                    t_idx = 0
+                    while m_idx < len(tail_unmatched_master) and t_idx < len(tail_unmatched_target):
+                        match = cumulative_matcher.match_joint(
+                            tail_unmatched_master, m_idx,
+                            tail_unmatched_target, t_idx
+                        )
+
+                        if match is not None:
+                            cumulative_matches.append(match)
+                            m_idx += len(match.master_joints)
+                            t_idx += len(match.target_joints)
+                        else:
+                            shifted_match = None
+                            if t_idx + 1 < len(tail_unmatched_target):
+                                shifted_match = cumulative_matcher.match_joint(
+                                    tail_unmatched_master, m_idx,
+                                    tail_unmatched_target, t_idx + 1
+                                )
+                            if shifted_match is not None:
+                                t_idx += 1
+                            else:
+                                m_idx += 1
         except:
             pass
         

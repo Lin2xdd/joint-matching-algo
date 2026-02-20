@@ -36,15 +36,30 @@ Excel file with 3 tabs:
 
 ### Phase 2: Cumulative Length Matching (for unmatched joints)
 - Handles 1-to-1, 1-to-many (splits), many-to-1 (merges)
-- Uses configurable tolerance (default 10%)
+- Uses configurable tolerance (default 20%)
 - Calculates confidence scores
-- Greedy matching strategy
+- Greedy matching strategy with local target-shift recovery
+
+## Matching Determination Rules (Current)
+
+For forward, backward, and cumulative matching:
+
+1. Calculate confidence score from length ratio difference.
+2. **High confidence match** if `confidence > 0.60`.
+3. If not high, check length ratio tolerance.
+4. **Low confidence match** if length ratio difference is within `20%` tolerance.
+5. Otherwise reject.
+
+This means:
+- `High` = score above 0.60
+- `Low` = score at or below 0.60 but still within 20% tolerance
+- Rejected = outside tolerance
 
 ## Key Parameters
 
 ```python
 USE_CUMULATIVE = True              # Enable cumulative matching
-CUMULATIVE_TOLERANCE = 0.10        # 10% length tolerance
+CUMULATIVE_TOLERANCE = 0.20        # 20% length tolerance
 CUMULATIVE_MAX_AGGREGATE = 5       # Max joints to combine
 CUMULATIVE_MIN_CONFIDENCE = 0.60   # Minimum confidence
 ```
@@ -56,9 +71,30 @@ CUMULATIVE_MIN_CONFIDENCE = 0.60   # Minimum confidence
 - Master/Target Length (m)
 - **Length Difference (m)**: Absolute difference
 - **Length Ratio**: Difference / Average length
-- **Confidence Score**: 0.60 to 1.00
+- **Confidence Score**: 0.60 to 1.00 (for accepted matches)
+- **Confidence Level**: `High` or `Low`
 - **Match Source**: "Original Algorithm" or "Cumulative Matching"
 - **Match Type**: "1-to-1", "1-to-2", "2-to-1", etc.
+
+## Implemented Fixes
+
+1. **Skip-branch recording fix (forward/backward)**
+   - Previously, a skipped low-confidence pair could still be appended to matched records.
+   - Now skipped pairs are not recorded as matches.
+
+2. **Confidence level reporting**
+   - Added output column: `Confidence Level`.
+   - Levels now use `High` / `Low` with unmatched rows blank.
+
+3. **Tolerance upgrade to 20%**
+   - Default tolerance updated from 10% to 20% for integrated/cumulative matching behavior.
+
+4. **Tail block processing fix (after last marker)**
+   - After-last-marker region now runs full **Forward → Backward → Cumulative** flow.
+   - Uses index-safe bounds and avoids relying on joint-number values as dataframe indices.
+
+5. **Cumulative alignment recovery**
+   - Added one-step target-shift probe in cumulative unmatched loop to recover local offset alignment.
 
 ## When to Adjust Parameters
 
@@ -96,5 +132,5 @@ cumulative_max_aggregate = 10      # Allow more aggregation
 
 ---
 
-**Date**: 2026-02-13  
-**Version**: 1.0
+**Date**: 2026-02-19  
+**Version**: 1.1
