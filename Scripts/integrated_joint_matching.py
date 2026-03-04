@@ -73,13 +73,18 @@ def _evaluate_match_quality(length1: float,
     Determine match acceptance and confidence tier.
 
     Rules:
-    a) confidence > threshold -> accepted as high confidence
-    b) else if length ratio within tolerance -> accepted as low confidence
+    a) confidence >= 60% (score >= 0.60) -> accepted as high confidence
+    b) else if length ratio within tolerance (diff <= 20%) -> accepted as medium confidence
     c) else rejected
+
+    Confidence Levels:
+    - High: >= 60% (confidence score >= 0.60)
+    - Medium: < 60% but length difference ratio <= 20% (within tolerance but below high threshold)
+    - Low: Only for short joint matches (joints < 1m matched by position)
 
     Returns:
         (accepted, score_to_store, tier)
-        tier in {'high', 'low', 'reject'}
+        tier in {'high', 'medium', 'reject'}
     """
     confidence = _calculate_confidence(length1, length2, tolerance=tolerance)
 
@@ -87,25 +92,38 @@ def _evaluate_match_quality(length1: float,
         return True, confidence, 'high'
 
     if _is_length_within_tolerance(length1, length2, tolerance=tolerance):
-        # Accepted by tolerance fallback; store as low confidence floor.
-        return True, confidence_threshold, 'low'
+        # Accepted by tolerance fallback; store as medium confidence floor.
+        return True, confidence_threshold, 'medium'
 
     return False, confidence, 'reject'
 
 
 def _confidence_level_from_score(confidence_score, match_source: str = '') -> str:
-    """Map numeric confidence score to a level label for reporting."""
+    """
+    Map numeric confidence score to a level label for reporting.
+    
+    Confidence Levels:
+    - High: >= 60% (score >= 0.60) - Strong length agreement
+    - Medium: < 60% (score < 0.60) but within 20% length tolerance
+    - Low: Only for short joint matches (joints < 1m)
+    
+    Note: The match_source 'Short Joint Matching' always gets 'Low' confidence.
+    """
     if match_source == 'Unmatched Master' or match_source == 'Unmatched Target':
         return ''
     if match_source == 'Marker':
         return 'High'
+    if match_source == 'Short Joint Matching':
+        return 'Low'
 
     try:
         score = float(confidence_score)
     except (TypeError, ValueError):
         return ''
 
-    return 'High' if score > 0.60 else 'Low'
+    # High confidence: >= 60%
+    # Medium confidence: < 60% (these are within tolerance fallback matches)
+    return 'High' if score >= 0.60 else 'Medium'
 
 
 def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
@@ -114,8 +132,8 @@ def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
                         threshold: float, min_confidence: float = 0.60) -> Tuple[pd.DataFrame, int, int]:
     """
     Forward match check function with confidence + tolerance fallback:
-      a) confidence > min_confidence -> high confidence match
-      b) else if within length tolerance -> mid confidence match
+      a) confidence >= min_confidence (0.60 = 60%) -> high confidence match
+      b) else if within length tolerance (diff <= 0.20 = 20%) -> medium confidence match
       c) else reject
     
     Args:
@@ -126,7 +144,7 @@ def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
         end_fix: Ending index in master
         end_move: Ending index in target
         threshold: Length difference threshold (legacy parameter, kept for compatibility)
-        min_confidence: High-confidence threshold (default 0.60)
+        min_confidence: High-confidence threshold (default 0.60 = 60%)
     
     Returns:
         Tuple of (matched_pairs DataFrame, fix_break_loc, move_break_loc)
@@ -170,7 +188,7 @@ def forward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
                 [matched_pairs, matched_points], ignore_index=True)
         elif (not pair1_accept) and pair2_accept and pair3_accept:
             # Skip this joint but continue if next two are confident.
-            # Do NOT append a low-confidence pair as a match record.
+            # Do NOT append this below-threshold pair as a match record.
             continue
         else:
             fix_break_loc = i + init_fix
@@ -186,8 +204,8 @@ def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
                          threshold: float, min_confidence: float = 0.60) -> Tuple[pd.DataFrame, int, int]:
     """
     Backward match check function with confidence + tolerance fallback:
-      a) confidence > min_confidence -> high confidence match
-      b) else if within length tolerance -> mid confidence match
+      a) confidence >= min_confidence (0.60 = 60%) -> high confidence match
+      b) else if within length tolerance (diff <= 0.20 = 20%) -> medium confidence match
       c) else reject
     
     Args:
@@ -198,7 +216,7 @@ def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
         end_fix: Ending index in master
         end_move: Ending index in target
         threshold: Length difference threshold (legacy parameter, kept for compatibility)
-        min_confidence: High-confidence threshold (default 0.60)
+        min_confidence: High-confidence threshold (default 0.60 = 60%)
     
     Returns:
         Tuple of (matched_pairs DataFrame, fix_break_loc, move_break_loc)
@@ -236,7 +254,7 @@ def backward_match_check(fix: pd.DataFrame, move: pd.DataFrame,
                 [matched_pairs, matched_points], ignore_index=True)
         elif (not pair1_accept) and pair2_accept and pair3_accept:
             # Skip this joint but continue if next two are confident.
-            # Do NOT append a low-confidence pair as a match record.
+            # Do NOT append this below-threshold pair as a match record.
             continue
         else:
             fix_break_loc = end_fix - i
@@ -348,7 +366,7 @@ class CumulativeLengthMatcher:
         target_joint = target_df.iloc[t_idx]
         
         # Try 1-to-1 first with the same decision policy used by forward/backward.
-        # a) confidence > 60% -> high, b) else within 20% tolerance -> mid, else reject.
+        # a) confidence >= 60% -> high, b) else within 20% tolerance -> medium, c) else reject.
         pair_accept, pair_score, _ = _evaluate_match_quality(
             master_joint['joint_length'],
             target_joint['joint_length'],
@@ -388,8 +406,8 @@ class CumulativeLengthMatcher:
                 split_penalty = 0.05 * (t_count - 1)
                 confidence = max(base_confidence - split_penalty, 0.0)
                 
-                # Keep existing 1-to-many behavior, but allow tolerance fallback as mid confidence
-                # when confidence is <= threshold.
+                # Keep existing 1-to-many behavior, but allow tolerance fallback as medium confidence
+                # when confidence is <= threshold (stores min_confidence as the floor value).
                 if confidence > self.min_confidence or self._is_length_match(master_joint['joint_length'], cumulative_target):
                     return JointMatch(
                         master_joints=[int(master_joint['joint_number'])],
@@ -423,8 +441,8 @@ class CumulativeLengthMatcher:
                 merge_penalty = 0.05 * (m_count - 1)
                 confidence = max(base_confidence - merge_penalty, 0.0)
                 
-                # Keep existing many-to-1 behavior, but allow tolerance fallback as mid confidence
-                # when confidence is <= threshold.
+                # Keep existing many-to-1 behavior, but allow tolerance fallback as medium confidence
+                # when confidence is <= threshold (stores min_confidence as the floor value).
                 if confidence > self.min_confidence or self._is_length_match(cumulative_master, target_joint['joint_length']):
                     return JointMatch(
                         master_joints=master_joints_list.copy(),
@@ -1112,6 +1130,159 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
             })
         
         # Determine final unmatched joints
+        final_unmatched_master = all_master_joints - final_matched_master
+        final_unmatched_target = all_target_joints - final_matched_target
+        
+        # ========== SHORT JOINT MATCHING ==========
+        # For remaining unmatched joints < 1m, use matched joints' positions to determine matches.
+        # This is the only scenario that produces LOW confidence matches.
+        # Strategy: Find unmatched short joints "trapped" between matched joints and match them
+        # to target joints in the corresponding bounded region.
+        # NO tolerance or length validation is applied - matching is purely position-based.
+        # As long as sequencing is confirmed, short joints are matched with low confidence.
+        logger.info("Performing short joint matching for unmatched joints < 1m...")
+        
+        # Build mapping of matched joints (master -> target)
+        master_to_target_map = {}
+        for match_dict in matched_joints_list:
+            master_joint = match_dict['Master Joint Number']
+            target_joint = match_dict['Target Joint Number']
+            # Handle comma-separated (aggregate) matches - use first joint
+            if isinstance(master_joint, str) and ',' in master_joint:
+                master_joint = int(master_joint.split(',')[0])
+            else:
+                master_joint = int(master_joint)
+            if isinstance(target_joint, str) and ',' in target_joint:
+                target_joint = int(target_joint.split(',')[0])
+            else:
+                target_joint = int(target_joint)
+            master_to_target_map[master_joint] = target_joint
+        
+        # Get sorted list of all master and target joints
+        all_master_sorted = sorted([int(j) for j in all_master_joints])
+        all_target_sorted = sorted([int(j) for j in all_target_joints])
+        
+        # Find unmatched joints < 1m
+        short_unmatched_master = []
+        for joint_num_str in final_unmatched_master:
+            joint_num = int(joint_num_str)
+            length = master_length_map.get(joint_num, 0)
+            if 0 < length < 1.0:
+                short_unmatched_master.append((joint_num, length))
+        
+        short_unmatched_target = []
+        for joint_num_str in final_unmatched_target:
+            joint_num = int(joint_num_str)
+            length = target_length_map.get(joint_num, 0)
+            if 0 < length < 1.0:
+                short_unmatched_target.append((joint_num, length))
+        
+        short_joint_matches = []
+        used_target_joints = set()
+        
+        # For each unmatched short master joint
+        for m_joint_num, m_length in short_unmatched_master:
+            # Find matched joints immediately before and after this master joint
+            m_idx = all_master_sorted.index(m_joint_num)
+            
+            # Find previous matched master joint
+            prev_matched_master = None
+            for i in range(m_idx - 1, -1, -1):
+                if all_master_sorted[i] in master_to_target_map:
+                    prev_matched_master = all_master_sorted[i]
+                    break
+            
+            # Find next matched master joint
+            next_matched_master = None
+            for i in range(m_idx + 1, len(all_master_sorted)):
+                if all_master_sorted[i] in master_to_target_map:
+                    next_matched_master = all_master_sorted[i]
+                    break
+            
+            # Determine the search range in target using matched joints' positions
+            if prev_matched_master is not None and next_matched_master is not None:
+                # Normal case: bounded by two matched joints
+                prev_matched_target = master_to_target_map[prev_matched_master]
+                next_matched_target = master_to_target_map[next_matched_master]
+                
+                # Find ALL unmatched target joints < 1m in this range (no length validation)
+                candidates = []
+                for t_joint_num, t_length in short_unmatched_target:
+                    if t_joint_num in used_target_joints:
+                        continue
+                    if min(prev_matched_target, next_matched_target) < t_joint_num < max(prev_matched_target, next_matched_target):
+                        candidates.append((t_joint_num, t_length))
+                
+            elif prev_matched_master is not None:
+                # At the end: only have previous matched joint
+                prev_matched_target = master_to_target_map[prev_matched_master]
+                candidates = []
+                for t_joint_num, t_length in short_unmatched_target:
+                    if t_joint_num in used_target_joints:
+                        continue
+                    if t_joint_num > prev_matched_target:
+                        candidates.append((t_joint_num, t_length))
+                        
+            elif next_matched_master is not None:
+                # At the beginning: only have next matched joint
+                next_matched_target = master_to_target_map[next_matched_master]
+                candidates = []
+                for t_joint_num, t_length in short_unmatched_target:
+                    if t_joint_num in used_target_joints:
+                        continue
+                    if t_joint_num < next_matched_target:
+                        candidates.append((t_joint_num, t_length))
+            else:
+                # No matched joints before or after - skip this joint
+                continue
+            
+            # If we found candidate(s), match with the closest one by joint number
+            # No length tolerance check - sequencing alone confirms the match
+            if candidates:
+                candidates.sort(key=lambda x: abs(x[0] - m_joint_num))
+                t_joint_num, t_length = candidates[0]
+                used_target_joints.add(t_joint_num)
+                
+                # Create LOW confidence match (position-based only, no length validation)
+                # This is the ONLY scenario that produces Low confidence matches.
+                # Sequencing is sufficient - no tolerance requirements.
+                # Calculate confidence score dynamically from actual length data
+                length_diff = abs(m_length - t_length)
+                avg_length = (m_length + t_length) / 2
+                diff_ratio = (length_diff / avg_length) if avg_length > 0 else 0
+                
+                # Calculate confidence using standard formula but without tolerance constraint
+                # confidence = 1.0 - (diff_ratio / tolerance)
+                # Using tolerance of 0.20 for calculation only (not as a filter)
+                tolerance = 0.20
+                calculated_confidence = max(0.0, 1.0 - (diff_ratio / tolerance))
+                
+                short_joint_matches.append({
+                    'Master ILI ID': fix_ili_id,
+                    'Master Joint Number': m_joint_num,
+                    'Master Total Length (m)': round(m_length, 3),
+                    'Target Joint Number': t_joint_num,
+                    'Target Total Length (m)': round(t_length, 3),
+                    'Target ILI ID': move_ili_id,
+                    'Length Difference (m)': round(length_diff, 3),
+                    'Length Ratio': round(diff_ratio, 4),
+                    'Confidence Score': round(calculated_confidence, 3),  # Calculated from data
+                    'Confidence Level': _confidence_level_from_score(round(calculated_confidence, 3), 'Short Joint Matching'),  # Always 'Low'
+                    'Match Source': 'Short Joint Matching',
+                    'Match Type': '1-to-1 (short joint)'
+                })
+                
+                # Update matched sets
+                final_matched_master.add(str(m_joint_num))
+                final_matched_target.add(str(t_joint_num))
+        
+        if short_joint_matches:
+            logger.info(f"  Found {len(short_joint_matches)} short joint matches (< 1m)")
+            matched_joints_list.extend(short_joint_matches)
+        else:
+            logger.info("  No short joint matches found")
+        
+        # Recalculate final unmatched joints after short joint matching
         final_unmatched_master = all_master_joints - final_matched_master
         final_unmatched_target = all_target_joints - final_matched_target
         

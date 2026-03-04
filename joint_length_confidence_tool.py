@@ -1,5 +1,5 @@
 """
-Standalone utility to generate low/high confidence match bounds for a joint length.
+Standalone utility to generate medium/high confidence match bounds for a joint length.
 
 Defaults:
     - Difference ratio tolerance: 20% (0.20)
@@ -16,7 +16,7 @@ difference ratio is:
 
 This yields:
     - High-confidence range (narrow, centered on joint length)
-    - Low-confidence edge bands (within tolerance, but below threshold)
+    - Medium-confidence edge bands (within tolerance, but below threshold)
     - Overall tolerated range
 
 Usage examples:
@@ -37,7 +37,7 @@ DEFAULT_CONFIDENCE_THRESHOLD_PERCENT = 80.0
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate low/high confidence length bounds from joint length, tolerance, and confidence threshold."
+        description="Generate medium/high confidence length bounds from joint length, tolerance, and confidence threshold."
     )
     parser.add_argument(
         "--joint-length",
@@ -123,7 +123,7 @@ def _build_report_text(bounds: dict[str, float]) -> str:
             f"  Lower bound:              {high_lower:.6f}",
             f"  Upper bound:              {high_upper:.6f}",
             "-",
-            "LOW CONFIDENCE RANGE (< threshold, but within tolerance)",
+            "MEDIUM CONFIDENCE RANGE (< threshold, but within tolerance)",
             "  Lower side band:",
             f"    {overall_lower:.6f}  to  {high_lower:.6f}",
             "  Upper side band:",
