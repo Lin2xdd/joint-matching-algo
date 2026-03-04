@@ -13,10 +13,12 @@ Workflow:
    - Step 1: Backward matching (from first marker toward start)
    - Step 2: Forward matching (fill gaps from start)
    - Step 3: Cumulative matching in reverse order (align with backward direction)
+   - **EXCLUDES first marker** to prevent duplicate matching
 4. Tail section (after last marker):
    - Step 1: Forward matching (from last marker toward end)
    - Step 2: Backward matching (fill gaps from end)
    - Step 3: Cumulative matching in forward order (align with forward direction)
+   - **EXCLUDES last marker** to prevent duplicate matching
 5. Merge all matched results and report unmatched joints
 6. Export to Excel with matched and unmatched tabs
 
@@ -26,9 +28,12 @@ Key Design Notes:
 - Tail section cumulative matching processes in FORWARD order to align with
   forward matching direction
 - Both head and tail use full matching pipeline: backward/forward → cumulative
+- **Marker Exclusion:** Markers are excluded from head/tail cumulative matching
+  ranges because they're already matched during marker alignment (Step 1).
+  This prevents duplicate matches where the same joint is matched multiple times.
 
 Author: Integrated Joint Matching System
-Date: 2026-03-04 (Updated for head/tail section cumulative matching)
+Date: 2026-03-04 (Updated for marker exclusion fix to prevent duplicate matches)
 """
 
 import uuid
@@ -1142,9 +1147,12 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 
             # Comprehensive cumulative matching: Process ALL unmatched joints in head section
             if cumulative_matcher:
-                # Get all joints in head section
-                all_head_master = fix_data.iloc[head_init_fix:head_end_fix+1].copy()
-                all_head_target = move_data.iloc[head_init_move:head_end_move+1].copy()
+                # Get all joints in head section (EXCLUDING the first marker at head_end_fix)
+                # WHY EXCLUDE: The marker at head_end_fix was already matched during marker alignment.
+                # Including it here would create duplicate matches (same joint matched twice).
+                # Range: [head_init_fix, head_end_fix) - excludes head_end_fix
+                all_head_master = fix_data.iloc[head_init_fix:head_end_fix].copy()
+                all_head_target = move_data.iloc[head_init_move:head_end_move].copy()
                 
                 # Filter to only unmatched joints
                 head_unmatched_master = all_head_master[~all_head_master.index.isin(head_matched_master_indices)].copy().reset_index(drop=True)
@@ -1237,9 +1245,12 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
 
             # Comprehensive cumulative matching: Process ALL unmatched joints in tail section
             if cumulative_matcher:
-                # Get all joints in tail section
-                all_tail_master = fix_data.iloc[tail_init_fix:tail_end_fix+1].copy()
-                all_tail_target = move_data.iloc[tail_init_move:tail_end_move+1].copy()
+                # Get all joints in tail section (EXCLUDING the last marker at tail_init_fix)
+                # WHY EXCLUDE: The marker at tail_init_fix was already matched during marker alignment.
+                # Including it here would create duplicate matches (same joint matched twice).
+                # Range: (tail_init_fix, tail_end_fix] - excludes tail_init_fix
+                all_tail_master = fix_data.iloc[tail_init_fix+1:tail_end_fix+1].copy()
+                all_tail_target = move_data.iloc[tail_init_move+1:tail_end_move+1].copy()
                 
                 # Filter to only unmatched joints
                 tail_unmatched_master = all_tail_master[~all_tail_master.index.isin(tail_matched_master_indices)].copy().reset_index(drop=True)

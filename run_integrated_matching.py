@@ -43,7 +43,7 @@ def main():
     
     # Inspection GUIDs
     MASTER_GUID = "6f69d5d6-4d0e-4c16-a66d-207d03017b12"
-    TARGET_GUIDS = ["d7c49f3d-7da7-49ff-9c2b-c09d388b74ba"] 
+    TARGET_GUIDS = ["5dcc8b72-ec74-4fbc-98a5-54c2e5c902ed"]
     
     # Output file path (relative to current workspace directory)
     OUTPUT_PATH = "Sample Output/integrated_matching_results.xlsx"
