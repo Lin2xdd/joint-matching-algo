@@ -21,7 +21,7 @@ from integrated_joint_matching import execute_integrated_joint_matching
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
@@ -36,21 +36,21 @@ def main():
     DB_CONFIG = {
         'host': 'localhost',
         'port': '5432',
-        'database': 'ili',
+        'database': 'joint-matching',
         'user': 'postgres',
         'password': 'RedPlums2025.'
     }
     
     # Inspection GUIDs
-    MASTER_GUID = "f7e2c9d5-8a4b-4e1f-b3c6-d8a2e7f1c5b4"
-    TARGET_GUIDS = ["a3f5c2e1-7b9d-4f8c-9e2a-b1d6c4f7e2a9"]
+    MASTER_GUID = "6f69d5d6-4d0e-4c16-a66d-207d03017b12"
+    TARGET_GUIDS = ["d7c49f3d-7da7-49ff-9c2b-c09d388b74ba"] 
     
     # Output file path (relative to current workspace directory)
     OUTPUT_PATH = "Sample Output/integrated_matching_results.xlsx"
     
     # Cumulative matching parameters
     USE_CUMULATIVE = True  # Set to False to disable cumulative matching
-    CUMULATIVE_TOLERANCE = 0.20  # 20% length tolerance
+    CUMULATIVE_TOLERANCE = 0.30  # 30% length tolerance
     CUMULATIVE_MAX_AGGREGATE = 5  # Max joints to combine
     CUMULATIVE_MIN_CONFIDENCE = 0.60  # Minimum confidence score
     

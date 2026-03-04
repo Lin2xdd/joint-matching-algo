@@ -319,9 +319,25 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
     with engine.connect() as conn:
         joint_list = pd.read_sql_query(con=conn, sql=joint_query, params=params)
         
+        logger.info(f"Raw query returned {len(joint_list)} records")
+        
         # Drop null values
         smaller_subset = ['joint_number', 'joint_length', 'insp_guid', 'ili_id']
         joint_list = joint_list.dropna(subset=smaller_subset).reset_index(drop=True)
+        
+        # Deduplicate: Keep only the first entry per joint number for each inspection
+        # This handles cases where multiple records exist for the same joint (e.g., features/anomalies)
+        records_before_dedup = len(joint_list)
+        joint_list = joint_list.drop_duplicates(
+            subset=['insp_guid', 'joint_number'],
+            keep='first'
+        ).reset_index(drop=True)
+        records_after_dedup = len(joint_list)
+        
+        if records_before_dedup > records_after_dedup:
+            duplicates_removed = records_before_dedup - records_after_dedup
+            logger.info(f"Deduplication: Removed {duplicates_removed} duplicate joint records")
+            logger.info(f"  (Kept first occurrence of each joint_number per insp_guid)")
 
     logger.info("Database query successful")
 
@@ -504,7 +520,9 @@ def execute_joint_matching(engine: Engine, master_guid: str, target_guids: List[
                 j = temp_fix_match
                 temp_move_match = i
             else:
-                if (temp.any() & (length_diff < 10)) | (temp.any() & (index_diff2 == 0) & (index_diff3 == 0) & (index_diff4 == 0)):
+                # Require BOTH reasonable cumulative length AND marker alignment
+                # This prevents matching joints from completely different pipeline sections
+                if temp.any() & (length_diff < 10) & ((index_diff2 == 0) | (index_diff3 == 0) | (index_diff4 == 0)):
                     temp_fix_match = temp.idxmax()
                     matched_points = pd.DataFrame(
                         np.array([temp_fix_match, i, 1]).reshape(1, 3),
