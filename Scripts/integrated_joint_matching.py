@@ -1,7 +1,8 @@
 """
 Integrated Joint Matching Algorithm
 Single-phase matching with marker alignment, confidence-based forward/backward matching,
-cumulative length matching for complex joint relationships, and absolute distance matching.
+cumulative length matching for complex joint relationships, absolute distance matching,
+and short joint merge post-processing.
 
 Workflow:
 1. Marker alignment between inspections
@@ -19,11 +20,16 @@ Workflow:
    - Step 2: Backward matching (fill gaps from end)
    - Step 3: Cumulative matching in forward order (align with forward direction)
    - **EXCLUDES last marker** to prevent duplicate matching
-5. Absolute distance matching (final round):
+5. Absolute distance matching:
    - Match remaining unmatched joints with absolute length difference < 1.5m
    - Position-based matching between known matched joints (low confidence)
-6. Merge all matched results and report unmatched joints
-7. Export to Excel with matched and unmatched tabs
+6. Short joint merge post-processing:
+   - Merge unmatched short joints (< 3m) with neighboring matched joints
+   - Creates 1-to-many, many-to-1, or many-to-many matches as appropriate
+   - Validates merged matches against confidence & tolerance thresholds
+   - Example: M2770 → T2770 (1-to-1) + unmatched T2780 → M2770 → T2770+T2780 (1-to-2)
+7. Merge all matched results and report unmatched joints
+8. Export to Excel with matched and unmatched tabs
 
 Key Design Notes:
 - Head section cumulative matching processes in REVERSE order to align with
@@ -34,12 +40,15 @@ Key Design Notes:
 - **Marker Exclusion:** Markers are excluded from head/tail cumulative matching
   ranges because they're already matched during marker alignment (Step 1).
   This prevents duplicate matches where the same joint is matched multiple times.
-- **Absolute Distance Matching:** Final round matches unmatched joints where
-  absolute length difference < 1.5m, using position context from matched joints.
-  This produces LOW confidence matches.
+- **Absolute Distance Matching:** Matches unmatched joints where absolute length
+  difference < 1.5m, using position context from matched joints. Produces LOW confidence.
+- **Unmatched Joint Merge:** Post-processes ALL remaining unmatched joints by attempting
+  to merge them with neighboring matched joints. Processes joints sequentially and updates
+  match index dynamically, enabling cascading merges. Prevents greedy 1-to-1 bias where a
+  dominant piece matches but leaves other pieces unmatched.
 
 Author: Integrated Joint Matching System
-Date: 2026-03-05 (Updated to replace short joint matching with absolute distance matching)
+Date: 2026-03-05 (Added short joint merge post-processing)
 """
 
 import uuid
@@ -61,6 +70,9 @@ from joint_matching import (
     smart_column_filter,
     safe_rename_columns
 )
+
+# Import post-processing merge
+from postprocessing_merge import postprocessing_merge
 
 logger = logging.getLogger(__name__)
 
@@ -604,6 +616,8 @@ def export_to_excel(matched_joints: pd.DataFrame,
                 'Total Matched Joints',
                 '  - From Original Algorithm',
                 '  - From Cumulative Matching',
+                '  - From Absolute Distance',
+                '  - From Post-Processing Merge',
                 'Total Unmatched Joints',
                 'Questionable Matches',
                 'Master Match Percentage',
@@ -621,6 +635,8 @@ def export_to_excel(matched_joints: pd.DataFrame,
                 run_summary.get('Matched_joints', 0),
                 run_summary.get('Matched_from_original', 0),
                 run_summary.get('Matched_from_cumulative', 0),
+                run_summary.get('Matched_from_absolute_distance', 0),
+                run_summary.get('Matched_from_postprocessing_merge', 0),
                 run_summary.get('Unmatched_joints', 0),
                 run_summary.get('Questionable_matches', 0),
                 f"{run_summary.get('Master_joint_percentage', 0):.2f}%",
@@ -1617,6 +1633,35 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         final_unmatched_master = all_master_joints - final_matched_master
         final_unmatched_target = all_target_joints - final_matched_target
         
+        # ========== POST-PROCESSING MERGE ==========
+        # Merge ALL unmatched joints with neighboring matched joints
+        # This handles cases like M2770 → T2770 matched (1-to-1), but T2780 remains unmatched
+        # The merge creates M2770 → T2770+T2780 (1-to-2) if it improves match quality
+        # Processes ALL unmatched joints sequentially, updating match index dynamically
+        logger.info("Performing post-processing merge...")
+        
+        matched_joints_list, final_matched_master, final_matched_target, postprocessing_merge_count = \
+            postprocessing_merge(
+                matched_joints_list=matched_joints_list,
+                final_matched_master=final_matched_master,
+                final_matched_target=final_matched_target,
+                all_master_joints=all_master_joints,
+                all_target_joints=all_target_joints,
+                master_length_map=master_length_map,
+                target_length_map=target_length_map,
+                fix_ili_id=fix_ili_id,
+                move_ili_id=move_ili_id,
+                tolerance=cumulative_tolerance,
+                min_confidence=cumulative_min_confidence
+            )
+        
+        if postprocessing_merge_count > 0:
+            logger.info(f"  Post-processing merge: {postprocessing_merge_count} joints merged into existing matches")
+        
+        # Recalculate final unmatched joints after unmatched joint merging
+        final_unmatched_master = all_master_joints - final_matched_master
+        final_unmatched_target = all_target_joints - final_matched_target
+        
         # Create integrated list with matched and unmatched joints interleaved
         integrated_list = []
         
@@ -1808,6 +1853,8 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
             "Matched_joints": len(matched_joints),
             "Matched_from_original": len(Match_all),
             "Matched_from_cumulative": len(cumulative_matches),
+            "Matched_from_absolute_distance": len(absolute_distance_matches),
+            "Matched_from_postprocessing_merge": postprocessing_merge_count,
             "Unmatched_joints": len(unmatched_joints),
             "Questionable_matches": len(questionable),
             "Master_joint_percentage": round((len(final_matched_master) / len(fix_df)) * 100, 2),
@@ -1822,6 +1869,8 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         logger.info(f"Total matched: {len(matched_joints)}")
         logger.info(f"  - From original algorithm: {len(Match_all)}")
         logger.info(f"  - From cumulative matching: {len(cumulative_matches)}")
+        logger.info(f"  - From absolute distance: {len(absolute_distance_matches)}")
+        logger.info(f"  - From post-processing merge: {postprocessing_merge_count}")
         logger.info(f"Total unmatched: {len(unmatched_joints)}")
         logger.info(f"Master match rate: {run_summary['Master_joint_percentage']:.2f}%")
         logger.info(f"Target match rate: {run_summary['Target_joint_percentage']:.2f}%")
