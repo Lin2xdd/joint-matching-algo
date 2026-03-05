@@ -1,7 +1,7 @@
 """
 Integrated Joint Matching Algorithm
 Single-phase matching with marker alignment, confidence-based forward/backward matching,
-and cumulative length matching for complex joint relationships.
+cumulative length matching for complex joint relationships, and absolute distance matching.
 
 Workflow:
 1. Marker alignment between inspections
@@ -19,8 +19,11 @@ Workflow:
    - Step 2: Backward matching (fill gaps from end)
    - Step 3: Cumulative matching in forward order (align with forward direction)
    - **EXCLUDES last marker** to prevent duplicate matching
-5. Merge all matched results and report unmatched joints
-6. Export to Excel with matched and unmatched tabs
+5. Absolute distance matching (final round):
+   - Match remaining unmatched joints with absolute length difference < 1.5m
+   - Position-based matching between known matched joints (low confidence)
+6. Merge all matched results and report unmatched joints
+7. Export to Excel with matched and unmatched tabs
 
 Key Design Notes:
 - Head section cumulative matching processes in REVERSE order to align with
@@ -31,9 +34,12 @@ Key Design Notes:
 - **Marker Exclusion:** Markers are excluded from head/tail cumulative matching
   ranges because they're already matched during marker alignment (Step 1).
   This prevents duplicate matches where the same joint is matched multiple times.
+- **Absolute Distance Matching:** Final round matches unmatched joints where
+  absolute length difference < 1.5m, using position context from matched joints.
+  This produces LOW confidence matches.
 
 Author: Integrated Joint Matching System
-Date: 2026-03-04 (Updated for marker exclusion fix to prevent duplicate matches)
+Date: 2026-03-05 (Updated to replace short joint matching with absolute distance matching)
 """
 
 import uuid
@@ -100,7 +106,7 @@ def _evaluate_match_quality(length1: float,
     Confidence Levels:
     - High: >= 60% (confidence score >= 0.60)
     - Medium: < 60% but length difference ratio <= 20% (within tolerance but below high threshold)
-    - Low: Only for short joint matches (joints < 1m matched by position)
+    - Low: Only for absolute distance matches (absolute length difference < 1.5m, matched by position)
 
     Returns:
         (accepted, score_to_store, tier)
@@ -125,15 +131,15 @@ def _confidence_level_from_score(confidence_score, match_source: str = '') -> st
     Confidence Levels:
     - High: >= 60% (score >= 0.60) - Strong length agreement
     - Medium: < 60% (score < 0.60) but within 20% length tolerance
-    - Low: Only for short joint matches (joints < 1m)
+    - Low: Only for absolute distance matches (absolute length difference < 1.5m)
     
-    Note: The match_source 'Short Joint Matching' always gets 'Low' confidence.
+    Note: The match_source 'Absolute Distance Matching' always gets 'Low' confidence.
     """
     if match_source == 'Unmatched Master' or match_source == 'Unmatched Target':
         return ''
     if match_source == 'Marker':
         return 'High'
-    if match_source == 'Short Joint Matching':
+    if match_source == 'Absolute Distance Matching':
         return 'Low'
 
     try:
@@ -1453,14 +1459,13 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         final_unmatched_master = all_master_joints - final_matched_master
         final_unmatched_target = all_target_joints - final_matched_target
         
-        # ========== SHORT JOINT MATCHING ==========
-        # For remaining unmatched joints < 1m, use matched joints' positions to determine matches.
+        # ========== ABSOLUTE DISTANCE MATCHING ==========
+        # For remaining unmatched joints, match those with absolute length difference < 1.5m.
         # This is the only scenario that produces LOW confidence matches.
-        # Strategy: Find unmatched short joints "trapped" between matched joints and match them
-        # to target joints in the corresponding bounded region.
-        # NO tolerance or length validation is applied - matching is purely position-based.
-        # As long as sequencing is confirmed, short joints are matched with low confidence.
-        logger.info("Performing short joint matching for unmatched joints < 1m...")
+        # Strategy: Find unmatched joints "trapped" between matched joints and match them
+        # to target joints in the corresponding bounded region where absolute length difference < 1.5m.
+        # Matching is position-based with absolute distance validation.
+        logger.info("Performing absolute distance matching for unmatched joints (absolute difference < 1.5m)...")
         
         # Build mapping of matched joints (master -> target)
         master_to_target_map = {}
@@ -1482,26 +1487,26 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         all_master_sorted = sorted([int(j) for j in all_master_joints])
         all_target_sorted = sorted([int(j) for j in all_target_joints])
         
-        # Find unmatched joints < 1m
-        short_unmatched_master = []
+        # Build list of all unmatched joints with their lengths
+        unmatched_master = []
         for joint_num_str in final_unmatched_master:
             joint_num = int(joint_num_str)
             length = master_length_map.get(joint_num, 0)
-            if 0 < length < 1.0:
-                short_unmatched_master.append((joint_num, length))
+            if length > 0:
+                unmatched_master.append((joint_num, length))
         
-        short_unmatched_target = []
+        unmatched_target = []
         for joint_num_str in final_unmatched_target:
             joint_num = int(joint_num_str)
             length = target_length_map.get(joint_num, 0)
-            if 0 < length < 1.0:
-                short_unmatched_target.append((joint_num, length))
+            if length > 0:
+                unmatched_target.append((joint_num, length))
         
-        short_joint_matches = []
+        absolute_distance_matches = []
         used_target_joints = set()
         
-        # For each unmatched short master joint
-        for m_joint_num, m_length in short_unmatched_master:
+        # For each unmatched master joint
+        for m_joint_num, m_length in unmatched_master:
             # Find matched joints immediately before and after this master joint
             m_idx = all_master_sorted.index(m_joint_num)
             
@@ -1525,47 +1530,53 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 prev_matched_target = master_to_target_map[prev_matched_master]
                 next_matched_target = master_to_target_map[next_matched_master]
                 
-                # Find ALL unmatched target joints < 1m in this range (no length validation)
+                # Find ALL unmatched target joints in this range with absolute distance < 1.5m
                 candidates = []
-                for t_joint_num, t_length in short_unmatched_target:
+                for t_joint_num, t_length in unmatched_target:
                     if t_joint_num in used_target_joints:
                         continue
                     if min(prev_matched_target, next_matched_target) < t_joint_num < max(prev_matched_target, next_matched_target):
-                        candidates.append((t_joint_num, t_length))
+                        # Check if absolute length difference < 1.5m
+                        if abs(m_length - t_length) < 1.5:
+                            candidates.append((t_joint_num, t_length))
                 
             elif prev_matched_master is not None:
                 # At the end: only have previous matched joint
                 prev_matched_target = master_to_target_map[prev_matched_master]
                 candidates = []
-                for t_joint_num, t_length in short_unmatched_target:
+                for t_joint_num, t_length in unmatched_target:
                     if t_joint_num in used_target_joints:
                         continue
                     if t_joint_num > prev_matched_target:
-                        candidates.append((t_joint_num, t_length))
+                        # Check if absolute length difference < 1.5m
+                        if abs(m_length - t_length) < 1.5:
+                            candidates.append((t_joint_num, t_length))
                         
             elif next_matched_master is not None:
                 # At the beginning: only have next matched joint
                 next_matched_target = master_to_target_map[next_matched_master]
                 candidates = []
-                for t_joint_num, t_length in short_unmatched_target:
+                for t_joint_num, t_length in unmatched_target:
                     if t_joint_num in used_target_joints:
                         continue
                     if t_joint_num < next_matched_target:
-                        candidates.append((t_joint_num, t_length))
+                        # Check if absolute length difference < 1.5m
+                        if abs(m_length - t_length) < 1.5:
+                            candidates.append((t_joint_num, t_length))
             else:
                 # No matched joints before or after - skip this joint
                 continue
             
             # If we found candidate(s), match with the closest one by joint number
-            # No length tolerance check - sequencing alone confirms the match
+            # Absolute distance < 1.5m validation already applied above
             if candidates:
                 candidates.sort(key=lambda x: abs(x[0] - m_joint_num))
                 t_joint_num, t_length = candidates[0]
                 used_target_joints.add(t_joint_num)
                 
-                # Create LOW confidence match (position-based only, no length validation)
+                # Create LOW confidence match (position-based with absolute distance < 1.5m validation)
                 # This is the ONLY scenario that produces Low confidence matches.
-                # Sequencing is sufficient - no tolerance requirements.
+                # Sequencing + absolute distance < 1.5m confirms the match.
                 # Calculate confidence score dynamically from actual length data
                 length_diff = abs(m_length - t_length)
                 avg_length = (m_length + t_length) / 2
@@ -1577,7 +1588,7 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                 tolerance = 0.30
                 calculated_confidence = max(0.0, 1.0 - (diff_ratio / tolerance))
                 
-                short_joint_matches.append({
+                absolute_distance_matches.append({
                     'Master ILI ID': fix_ili_id,
                     'Master Joint Number': m_joint_num,
                     'Master Total Length (m)': round(m_length, 3),
@@ -1587,22 +1598,22 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
                     'Length Difference (m)': round(length_diff, 3),
                     'Length Ratio': round(diff_ratio, 4),
                     'Confidence Score': round(calculated_confidence, 3),  # Calculated from data
-                    'Confidence Level': _confidence_level_from_score(round(calculated_confidence, 3), 'Short Joint Matching'),  # Always 'Low'
-                    'Match Source': 'Short Joint Matching',
-                    'Match Type': '1-to-1 (short joint)'
+                    'Confidence Level': _confidence_level_from_score(round(calculated_confidence, 3), 'Absolute Distance Matching'),  # Always 'Low'
+                    'Match Source': 'Absolute Distance Matching',
+                    'Match Type': '1-to-1 (absolute distance)'
                 })
                 
                 # Update matched sets
                 final_matched_master.add(str(m_joint_num))
                 final_matched_target.add(str(t_joint_num))
         
-        if short_joint_matches:
-            logger.info(f"  Found {len(short_joint_matches)} short joint matches (< 1m)")
-            matched_joints_list.extend(short_joint_matches)
+        if absolute_distance_matches:
+            logger.info(f"  Found {len(absolute_distance_matches)} absolute distance matches (absolute diff < 1.5m)")
+            matched_joints_list.extend(absolute_distance_matches)
         else:
-            logger.info("  No short joint matches found")
+            logger.info("  No absolute distance matches found")
         
-        # Recalculate final unmatched joints after short joint matching
+        # Recalculate final unmatched joints after absolute distance matching
         final_unmatched_master = all_master_joints - final_matched_master
         final_unmatched_target = all_target_joints - final_matched_target
         

@@ -52,43 +52,47 @@ Excel file with 3 tabs:
 - Calculates confidence scores
 - Greedy matching strategy with local target-shift recovery
 
-### Phase 3: Short Joint Matching (for remaining unmatched joints < 1m)
-- Position-based matching for short joints that couldn't be matched by length
+### Phase 3: Absolute Distance Matching (for remaining unmatched joints)
+- Position-based matching for joints with absolute length difference < 1.5m
 - Uses the sequence of nearby matched joints to define search boundaries
+- Validates candidates using absolute distance threshold (< 1.5m)
 - Selects matches based on numeric proximity of joint numbers
-- Produces Low confidence matches (no strict length validation required)
+- Produces Low confidence matches
 
-**How Short Joint Matching Works:**
+**How Absolute Distance Matching Works:**
 
-1. **Boundary Detection**: For each unmatched short master joint:
+1. **Boundary Detection**: For each unmatched master joint:
    - Find the nearest matched master joint **before** it
    - Find the nearest matched master joint **after** it
    - Map these to their corresponding matched target joints
    
-2. **Candidate Search**: Only search for target candidates **within the bounded region**:
+2. **Candidate Search**: Search for target candidates **within the bounded region** where absolute length difference < 1.5m:
    ```
    Example:
-   Master:  [Joint 100 (matched) ... Joint 105 (unmatched, <1m) ... Joint 110 (matched)]
-             ↓                                                        ↓
+   Master:  [Joint 100 (matched) ... Joint 105 (unmatched) ... Joint 110 (matched)]
+             ↓                                                  ↓
    Target:  [Joint 200 (matched) ... Joints 203,204,205 ... Joint 209 (matched)]
    
    Search region: Target joints between 200 and 209
+   Validation: |master_length - target_length| < 1.5m
    ```
 
-3. **Candidate Selection**: Among multiple candidates, select the target joint with the **numerically closest joint number**:
-   - Sort candidates by `|target_joint_number - master_joint_number|`
+3. **Candidate Selection**: Among validated candidates (absolute diff < 1.5m), select the target joint with the **numerically closest joint number**:
+   - Filter candidates where `|master_length - target_length| < 1.5`
+   - Sort remaining candidates by `|target_joint_number - master_joint_number|`
    - Select the one with minimum absolute difference
    - Mark both joints as matched with Low confidence
 
 4. **Confidence Scoring**:
    - Calculated dynamically from actual length data using standard formula
    - Always displayed as "Low" confidence level (position-based match)
-   - No strict tolerance requirement (sequencing confirms the match)
+   - Absolute distance < 1.5m requirement ensures reasonable length agreement
 
 **Key Characteristics:**
 - ✅ Leverages spatial consistency from nearby matched joints
 - ✅ Prevents cross-region false matches
-- ✅ Works when length-based matching fails (e.g., measurement errors on short joints)
+- ✅ Works for any joint length where absolute difference < 1.5m
+- ✅ More lenient than percentage-based tolerance for longer joints
 - ⚠️ Assumes joint numbering is roughly aligned between inspections
 
 ## Matching Determination Rules (Current)
@@ -98,13 +102,20 @@ For forward, backward, and cumulative matching:
 1. Calculate confidence score from length ratio difference.
 2. **High confidence match** if `confidence > 0.60`.
 3. If not high, check length ratio tolerance.
-4. **Low confidence match** if length ratio difference is within `30%` tolerance.
+4. **Medium confidence match** if length ratio difference is within `30%` tolerance.
 5. Otherwise reject.
 
+For absolute distance matching (final round):
+
+1. Filter candidates where `|master_length - target_length| < 1.5m`.
+2. Select best match by position proximity.
+3. **Low confidence match** for all absolute distance matches.
+
 This means:
-- `High` = score above 0.60
-- `Low` = score at or below 0.60 but still within 30% tolerance
-- Rejected = outside tolerance
+- `High` = score above 0.60 (forward/backward/cumulative matching)
+- `Medium` = score at or below 0.60 but still within 30% tolerance (cumulative matching)
+- `Low` = absolute distance < 1.5m, position-based match (absolute distance matching)
+- Rejected = outside tolerance and not within absolute distance threshold
 
 ## Key Parameters
 
@@ -122,10 +133,10 @@ CUMULATIVE_MIN_CONFIDENCE = 0.60   # Minimum confidence (60%)
 - Master/Target Length (m)
 - **Length Difference (m)**: Absolute difference
 - **Length Ratio**: Difference / Average length
-- **Confidence Score**: 0.60 to 1.00 (for accepted matches)
-- **Confidence Level**: `High` or `Low`
-- **Match Source**: "Original Algorithm" or "Cumulative Matching"
-- **Match Type**: "1-to-1", "1-to-2", "2-to-1", etc.
+- **Confidence Score**: 0.00 to 1.00 (calculated from length data)
+- **Confidence Level**: `High`, `Medium`, or `Low`
+- **Match Source**: "Marker", "Forward", "Backward", "Cumulative Matching", or "Absolute Distance Matching"
+- **Match Type**: "1-to-1", "1-to-2", "2-to-1", "1-to-1 (absolute distance)", etc.
 
 ## Confidence vs Length-Difference Ratio Chart
 
@@ -164,7 +175,8 @@ Where `length_ratio_diff = abs(L1 - L2) / ((L1 + L2) / 2)`.
 
 Confidence classes used below:
 - `High`: confidence `> 0.60` ⇒ `length_ratio_diff < 0.12`
-- `Low`: confidence `<= 0.60` and accepted by tolerance ⇒ `0.12 <= length_ratio_diff <= 0.30`
+- `Medium`: confidence `<= 0.60` and accepted by tolerance ⇒ `0.12 <= length_ratio_diff <= 0.30`
+- `Low`: absolute distance matching (absolute length difference < 1.5m)
 
 Range formula for a nominal joint length `L` and ratio limit `r`:
 - `T_min = L * (2 - r) / (2 + r)`
@@ -247,6 +259,18 @@ Range formula for a nominal joint length `L` and ratio limit `r`:
    - **Impact**: Significantly improves match rate in head and tail sections
    - **Result**: Joints like #10 now get proper cumulative matching consideration
 
+9. **Absolute Distance Matching (2026-03-05)**
+   - **Change**: Replaced "Short Joint Matching" with "Absolute Distance Matching"
+   - **Previous Behavior**: Matched only joints < 1m without length validation
+   - **New Behavior**: Matches ANY unmatched joints where absolute length difference < 1.5m
+   - **Benefits**:
+     - More lenient for longer joints (e.g., 10m joint with 1.4m difference = 14% ratio)
+     - Still validates length agreement (< 1.5m absolute difference)
+     - Better handles measurement variations on longer joints
+     - Uses same position-based strategy between matched joints
+   - **Confidence**: All matches get Low confidence level
+   - **Match Type**: "1-to-1 (absolute distance)"
+
 ## When to Adjust Parameters
 
 **High-quality data:**
@@ -283,10 +307,15 @@ cumulative_max_aggregate = 10      # Allow more aggregation
 
 ---
 
-**Date**: 2026-03-04
-**Version**: 1.4
+**Date**: 2026-03-05
+**Version**: 1.5
 
 ### Version History
+- **v1.5** (2026-03-05): Replaced short joint matching with absolute distance matching
+  - Changed from matching only joints < 1m to matching any joints with absolute difference < 1.5m
+  - More lenient for longer joints while maintaining length validation
+  - Better handles measurement variations across all joint lengths
+  - All absolute distance matches produce Low confidence level
 - **v1.4** (2026-03-04): Comprehensive head/tail cumulative matching enhancement
   - Enhanced cumulative matching to process ALL unmatched joints in head/tail sections
   - Track matched indices from forward/backward phases to prevent duplicates
