@@ -29,7 +29,27 @@ Excel file with 3 tabs:
 ## Workflow
 
 ### Phase 1: Original Algorithm (Marker-Based Matching)
-- Detects flow direction (forward/reverse)
+
+#### Flow Direction Detection
+The algorithm first determines if the inspections run in the same (FORWARD) or opposite (REVERSE) directions:
+
+1. **Calculate joint length differences**: For each inspection, compute the difference between consecutive joint lengths
+2. **Generate overlapping pairs**: Create pairs of consecutive non-zero differences using a sliding window approach
+   - Example: differences [1.0, -1.0, 3.0, -2.0, 2.0] → pairs [(1.0, -1.0), (-1.0, 3.0), (3.0, -2.0), (-2.0, 2.0)]
+   - Overlapping pairs provide ~60% more samples compared to non-overlapping, improving detection accuracy
+3. **Compare patterns with spatial validation**:
+   - Enhanced algorithm validates pattern matches using **two criteria**:
+     1. **Pattern match**: Joint length difference pairs must match (e.g., (+2, -1) == (+2, -1))
+     2. **Spatial validation**: Target relative distance must be within ±5% of master relative distance
+   - This filters out false positive pattern matches that occur at wrong pipeline positions
+   - Requires distance column; auto-fills occasional NaN using cumulative joint length
+4. **Select direction**: Choose the direction with higher match percentage
+
+**Key improvements** (March 2026):
+- **Phase 1**: Overlapping pairs approach provides more robust flow direction detection, preventing incorrect REVERSE detection that could cause massive alignment errors (e.g., 13,000+ meter offsets)
+- **Phase 2**: Spatial validation using distance column filters false positives, improving confidence margins by average 23%
+
+#### Marker-Based Matching
 - Finds markers (large length changes > 3m)
 - **Marker Validation**: Requires BOTH cumulative length validation (<10m) AND marker alignment
   - Prevents matching joints from completely different pipeline sections

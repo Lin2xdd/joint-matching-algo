@@ -12,7 +12,8 @@ Key Features:
   * High: confidence >= 60% (strong length agreement)
   * Medium: confidence < 60% but within 30% tolerance (acceptable length match)
   * Low: absolute length difference < 1.5m (position-based, independent of percentage)
-- Quality check bypassed for Low tier merges (position-based logic)
+- Uses absolute confidence threshold (same as cumulative matching)
+- Applies 5% penalty per extra joint for aggregate matches
 - Dynamic match index updating for sequential merge operations
 - Creates 1-to-many, many-to-1, or many-to-many matches as appropriate
 
@@ -20,18 +21,26 @@ Algorithm:
 1. Identifies ALL unmatched master and target joints
 2. For each unmatched joint, finds neighboring matched joints (by sequence)
 3. Attempts to merge the unmatched joint into the neighbor's existing match
-4. Validates using three-tier acceptance criteria
-5. For Low tier: bypasses quality check (position-based vs length-based)
-6. Updates match index dynamically for subsequent merges
+4. Calculates base confidence from length matching
+5. Applies aggregate penalty: 5% per extra joint (treating existing match as whole)
+6. Validates using three-tier acceptance criteria (absolute 60% threshold)
+7. Updates match index dynamically for subsequent merges
+
+Confidence Calculation:
+- Base confidence = f(length_match) using standard formula
+- Aggregate penalty = 0.05 × (num_master_joints - 1) + 0.05 × (num_target_joints - 1)
+- Final confidence = max(base_confidence - aggregate_penalty, 0.0)
+- Acceptance: High (≥60%), Medium (within 30%), or Low (abs diff < 1.5m)
 
 Important Notes:
-- Low tier merges (abs diff < 1.5m) do NOT require quality improvement
-  This allows split joints to be completed even when adding pieces worsens length matching
-- Quality check only applies to High/Medium tiers (length-based matching)
+- Uses absolute 60% threshold (not relative to original match quality)
+- Prioritizes quantity over quality: matches more joints even if quality degrades
+- Consecutive unmatched joints can be merged sequentially due to dynamic index updates
+- Same design philosophy as cumulative length matching algorithm
 
 Author: Joint Matching System
-Date: 2026-03-05
-Version: 2.0 (renamed from short_joint_merge.py)
+Date: 2026-03-06
+Version: 3.0 (Updated to absolute threshold + aggregate penalty)
 """
 
 import logging
@@ -71,7 +80,12 @@ def _evaluate_merge_quality(original_confidence: float,
                             merged_confidence: float,
                             improvement_threshold: float = 0.05) -> bool:
     """
-    Determine if a merge improves the match quality.
+    [OBSOLETE - No longer used as of v3.0]
+    
+    Previously used to determine if a merge improved match quality (relative check).
+    Replaced with absolute 60% threshold to prioritize quantity over quality.
+    
+    This function is kept for backward compatibility with diagnostic scripts.
     
     Args:
         original_confidence: Confidence of the original match
@@ -228,36 +242,42 @@ def postprocessing_merge(
                         logger.info(f"  Master total: {master_total}m, Target before: {target_total - unmatched_target_length}m")
                         logger.info(f"  After merge: Master {master_total}m vs Target {target_total}m")
                     
-                    # Evaluate merged match using three-tier confidence system
-                    merged_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    # Calculate base confidence from length match
+                    base_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    
+                    # Apply aggregate penalty (5% per extra joint, same as cumulative matching)
+                    # Existing match is treated as a whole unit when counting penalties
+                    # Example: Merging into 2-to-1 match adds penalties for both existing master joints
+                    new_target_joint_count = len(target_joints) + 1  # Adding unmatched_target
+                    master_joint_count = len(master_joints)  # Existing match's master side
+                    
+                    # Calculate penalties: 5% per joint beyond the first (1-to-1 has no penalty)
+                    master_penalty = 0.05 * (master_joint_count - 1) if master_joint_count > 1 else 0
+                    target_penalty = 0.05 * (new_target_joint_count - 1) if new_target_joint_count > 1 else 0
+                    total_penalty = master_penalty + target_penalty
+                    
+                    # Final confidence after applying aggregate complexity penalty
+                    merged_confidence = max(base_confidence - total_penalty, 0.0)
+                    
                     passes_tolerance = _is_length_within_tolerance(master_total, target_total, tolerance)
-                    passes_absolute_distance = abs(master_total - target_total) < 1.5  # Low confidence threshold
+                    passes_absolute_distance = abs(master_total - target_total) < 1.5
                     
-                    original_confidence = original_match.get('Confidence Score', 0)
-                    
-                    # Three-tier acceptance criteria:
+                    # Three-tier acceptance criteria (absolute threshold - prioritizes quantity over quality):
                     # High: confidence >= 60% (min_confidence) - strong length agreement
                     # Medium: confidence < 60% but within 30% tolerance - acceptable length match
-                    # Low: absolute length difference < 1.5m - POSITION-BASED (not percentage)
-                    #       Low tier allows split joints to complete even with poor length matching
+                    # Low: absolute length difference < 1.5m - position-based (ignores percentage)
                     accept_high = merged_confidence >= min_confidence
                     accept_medium = merged_confidence < min_confidence and passes_tolerance
                     accept_low = merged_confidence < min_confidence and not passes_tolerance and passes_absolute_distance
                     
                     # DEBUG for 2810
                     if unmatched_target_num == 2810:
-                        logger.info(f"  Merged conf: {merged_confidence:.3f}, Original conf: {original_confidence:.3f}")
+                        logger.info(f"  Base conf: {base_confidence:.3f}, Penalty: {total_penalty:.3f}, Final: {merged_confidence:.3f}")
                         logger.info(f"  Accept high: {accept_high}, medium: {accept_medium}, low: {accept_low}")
-                        logger.info(f"  Quality check: {_evaluate_merge_quality(original_confidence, merged_confidence)}")
                     
-                    # CRITICAL: Quality check bypassed for Low tier merges
-                    # Low tier is position-based (abs diff < 1.5m), so it should NOT be penalized
-                    # for poor length matching. This allows split joints to complete.
-                    # Quality check only applies to High/Medium tiers (length-based matching)
-                    passes_quality = accept_low or _evaluate_merge_quality(original_confidence, merged_confidence)
-                    
-                    # Accept merge if it meets any tier and passes quality check
-                    if (accept_high or accept_medium or accept_low) and passes_quality:
+                    # Accept merge using absolute threshold (v3.0: no comparison to original match quality)
+                    # This prioritizes matching more joints even if it degrades high-quality matches
+                    if accept_high or accept_medium or accept_low:
                         
                         # Create updated match
                         new_target_joints = target_joints + [unmatched_target_num]
@@ -309,9 +329,10 @@ def postprocessing_merge(
                     else:
                         # DEBUG for 2810: Log why merge was rejected
                         if unmatched_target_num == 2810:
-                            logger.info(f"  REJECTED: Merge did not pass criteria")
-                            logger.info(f"    Criteria passed: {(accept_high or accept_medium or accept_low)}")
-                            logger.info(f"    Quality OK: {_evaluate_merge_quality(original_confidence, merged_confidence)}")
+                            logger.info(f"  REJECTED: Merge did not pass any acceptance tier")
+                            logger.info(f"    High tier (>=60%): {accept_high}")
+                            logger.info(f"    Medium tier (within 30%): {accept_medium}")
+                            logger.info(f"    Low tier (abs<1.5m): {accept_low}")
         
         # If not merged with previous, try merging with next matched joint
         if unmatched_target_str not in merged_joints and next_target_num and str(next_target_num) in final_matched_target:
@@ -324,22 +345,29 @@ def postprocessing_merge(
                     master_total = sum(master_length_map.get(j, 0) for j in master_joints)
                     target_total = sum(target_length_map.get(j, 0) for j in target_joints) + unmatched_target_length
                     
-                    # Evaluate merged match using three-tier confidence system
-                    merged_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    # Calculate base confidence from length match
+                    base_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    
+                    # Apply aggregate penalty (5% per extra joint)
+                    new_target_joint_count = len(target_joints) + 1  # Adding unmatched_target
+                    master_joint_count = len(master_joints)
+                    
+                    master_penalty = 0.05 * (master_joint_count - 1) if master_joint_count > 1 else 0
+                    target_penalty = 0.05 * (new_target_joint_count - 1) if new_target_joint_count > 1 else 0
+                    total_penalty = master_penalty + target_penalty
+                    
+                    merged_confidence = max(base_confidence - total_penalty, 0.0)
+                    
                     passes_tolerance = _is_length_within_tolerance(master_total, target_total, tolerance)
-                    passes_absolute_distance = abs(master_total - target_total) < 1.5  # Low confidence threshold
+                    passes_absolute_distance = abs(master_total - target_total) < 1.5
                     
-                    original_confidence = original_match.get('Confidence Score', 0)
-                    
-                    # Three-tier acceptance criteria
+                    # Three-tier acceptance criteria (absolute threshold)
                     accept_high = merged_confidence >= min_confidence
                     accept_medium = merged_confidence < min_confidence and passes_tolerance
                     accept_low = merged_confidence < min_confidence and not passes_tolerance and passes_absolute_distance
                     
-                    # Quality check only applies to High/Medium tiers (not Low, which is position-based)
-                    passes_quality = accept_low or _evaluate_merge_quality(original_confidence, merged_confidence)
-                    
-                    if (accept_high or accept_medium or accept_low) and passes_quality:
+                    # Accept merge if it meets any tier (no relative quality check)
+                    if accept_high or accept_medium or accept_low:
                         
                         new_target_joints = [unmatched_target_num] + target_joints
                         new_target_joints_str = ','.join(map(str, sorted(new_target_joints)))
@@ -410,22 +438,29 @@ def postprocessing_merge(
                     master_total = sum(master_length_map.get(j, 0) for j in master_joints) + unmatched_master_length
                     target_total = sum(target_length_map.get(j, 0) for j in target_joints)
                     
-                    # Evaluate merged match using three-tier confidence system
-                    merged_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    # Calculate base confidence from length match
+                    base_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    
+                    # Apply aggregate penalty (5% per extra joint)
+                    new_master_joint_count = len(master_joints) + 1  # Adding unmatched_master
+                    target_joint_count = len(target_joints)
+                    
+                    master_penalty = 0.05 * (new_master_joint_count - 1) if new_master_joint_count > 1 else 0
+                    target_penalty = 0.05 * (target_joint_count - 1) if target_joint_count > 1 else 0
+                    total_penalty = master_penalty + target_penalty
+                    
+                    merged_confidence = max(base_confidence - total_penalty, 0.0)
+                    
                     passes_tolerance = _is_length_within_tolerance(master_total, target_total, tolerance)
-                    passes_absolute_distance = abs(master_total - target_total) < 1.5  # Low confidence threshold
+                    passes_absolute_distance = abs(master_total - target_total) < 1.5
                     
-                    original_confidence = original_match.get('Confidence Score', 0)
-                    
-                    # Three-tier acceptance criteria
+                    # Three-tier acceptance criteria (absolute threshold)
                     accept_high = merged_confidence >= min_confidence
                     accept_medium = merged_confidence < min_confidence and passes_tolerance
                     accept_low = merged_confidence < min_confidence and not passes_tolerance and passes_absolute_distance
                     
-                    # Quality check only applies to High/Medium tiers (not Low, which is position-based)
-                    passes_quality = accept_low or _evaluate_merge_quality(original_confidence, merged_confidence)
-                    
-                    if (accept_high or accept_medium or accept_low) and passes_quality:
+                    # Accept merge if it meets any tier (no relative quality check)
+                    if accept_high or accept_medium or accept_low:
                         
                         new_master_joints = master_joints + [unmatched_master_num]
                         new_master_joints_str = ','.join(map(str, sorted(new_master_joints)))
@@ -484,22 +519,29 @@ def postprocessing_merge(
                     master_total = sum(master_length_map.get(j, 0) for j in master_joints) + unmatched_master_length
                     target_total = sum(target_length_map.get(j, 0) for j in target_joints)
                     
-                    # Evaluate merged match using three-tier confidence system
-                    merged_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    # Calculate base confidence from length match
+                    base_confidence = _calculate_confidence(master_total, target_total, tolerance)
+                    
+                    # Apply aggregate penalty (5% per extra joint)
+                    new_master_joint_count = len(master_joints) + 1  # Adding unmatched_master
+                    target_joint_count = len(target_joints)
+                    
+                    master_penalty = 0.05 * (new_master_joint_count - 1) if new_master_joint_count > 1 else 0
+                    target_penalty = 0.05 * (target_joint_count - 1) if target_joint_count > 1 else 0
+                    total_penalty = master_penalty + target_penalty
+                    
+                    merged_confidence = max(base_confidence - total_penalty, 0.0)
+                    
                     passes_tolerance = _is_length_within_tolerance(master_total, target_total, tolerance)
-                    passes_absolute_distance = abs(master_total - target_total) < 1.5  # Low confidence threshold
+                    passes_absolute_distance = abs(master_total - target_total) < 1.5
                     
-                    original_confidence = original_match.get('Confidence Score', 0)
-                    
-                    # Three-tier acceptance criteria
+                    # Three-tier acceptance criteria (absolute threshold)
                     accept_high = merged_confidence >= min_confidence
                     accept_medium = merged_confidence < min_confidence and passes_tolerance
                     accept_low = merged_confidence < min_confidence and not passes_tolerance and passes_absolute_distance
                     
-                    # Quality check only applies to High/Medium tiers (not Low, which is position-based)
-                    passes_quality = accept_low or _evaluate_merge_quality(original_confidence, merged_confidence)
-                    
-                    if (accept_high or accept_medium or accept_low) and passes_quality:
+                    # Accept merge if it meets any tier (no relative quality check)
+                    if accept_high or accept_medium or accept_low:
                         
                         new_master_joints = [unmatched_master_num] + master_joints
                         new_master_joints_str = ','.join(map(str, sorted(new_master_joints)))

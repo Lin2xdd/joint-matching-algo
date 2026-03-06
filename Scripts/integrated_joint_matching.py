@@ -65,6 +65,7 @@ from joint_matching import (
     joint_diff_calc,
     pairs_generator,
     match_pct_calc,
+    match_pct_calc_with_distance,
     unchunk_dataframe,
     clean_column_none_to_null,
     smart_column_filter,
@@ -581,7 +582,46 @@ class CumulativeLengthMatcher:
         return None
 
 
-def export_to_excel(matched_joints: pd.DataFrame, 
+def _categorize_match_type(match_type_str: str) -> str:
+    """
+    Categorize match type string into standardized categories.
+    
+    Args:
+        match_type_str: Match type string (e.g., '1-to-1', '1-to-2', '2-to-1', 'Unmatched')
+    
+    Returns:
+        Category: '1-1', '1-many', 'many-1', 'many-many', or 'Unmatched'
+    """
+    if not match_type_str or match_type_str == 'Unmatched':
+        return 'Unmatched'
+    
+    # Handle absolute distance format: '1-to-1 (absolute distance)'
+    match_type_str = match_type_str.replace(' (absolute distance)', '')
+    
+    # Parse the match type (e.g., '1-to-1', '1-to-2', '2-to-1', '2-to-3')
+    if '-to-' in match_type_str:
+        parts = match_type_str.split('-to-')
+        if len(parts) == 2:
+            master_count = int(parts[0])
+            target_count = int(parts[1])
+            
+            if master_count == 1 and target_count == 1:
+                return '1-1'
+            elif master_count == 1 and target_count > 1:
+                return '1-many'
+            elif master_count > 1 and target_count == 1:
+                return 'many-1'
+            elif master_count > 1 and target_count > 1:
+                return 'many-many'
+    
+    # Default fallback for '1-to-1'
+    if match_type_str == '1-to-1':
+        return '1-1'
+    
+    return 'Unknown'
+
+
+def export_to_excel(matched_joints: pd.DataFrame,
                    unmatched_joints: pd.DataFrame,
                    run_summary: Dict,
                    output_path: str) -> bool:
@@ -647,10 +687,70 @@ def export_to_excel(matched_joints: pd.DataFrame,
         }
         summary_df = pd.DataFrame(summary_data)
         
+        # Build match type breakdown table
+        breakdown_df = None
+        if not matched_joints.empty and 'Match Source' in matched_joints.columns and 'Match Type' in matched_joints.columns:
+            # Filter to only actual matches (exclude unmatched rows)
+            actual_matches = matched_joints[
+                ~matched_joints['Match Source'].isin(['Unmatched Master', 'Unmatched Target'])
+            ].copy()
+            
+            if not actual_matches.empty:
+                # Categorize match types
+                actual_matches['Match_Type_Category'] = actual_matches['Match Type'].apply(_categorize_match_type)
+                
+                # Create pivot table
+                breakdown_pivot = pd.crosstab(
+                    actual_matches['Match Source'],
+                    actual_matches['Match_Type_Category'],
+                    margins=False
+                )
+                
+                # Ensure all expected columns exist (in desired order)
+                expected_columns = ['1-1', '1-many', 'many-1', 'many-many']
+                for col in expected_columns:
+                    if col not in breakdown_pivot.columns:
+                        breakdown_pivot[col] = 0
+                
+                # Reorder columns and convert to int
+                breakdown_pivot = breakdown_pivot[expected_columns].fillna(0).astype(int)
+                
+                # Reset index to make Match Source a column
+                breakdown_pivot = breakdown_pivot.reset_index()
+                breakdown_pivot = breakdown_pivot.rename(columns={'Match Source': 'Match Source'})
+                
+                breakdown_df = breakdown_pivot
+                logger.info(f"Created match type breakdown table with {len(breakdown_df)} sources")
+        
         # Write to Excel with multiple sheets
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Summary tab
-            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            # Summary tab with breakdown table
+            summary_df.to_excel(writer, sheet_name='Summary', index=False, startrow=0)
+            
+            # Add breakdown table below summary (with spacing)
+            if breakdown_df is not None:
+                startrow = len(summary_df) + 3  # Leave 2 blank rows
+                
+                # Add a header for the breakdown table
+                breakdown_header_df = pd.DataFrame({
+                    'Match Source': [''],
+                    '1-1': ['MATCH TYPE BREAKDOWN BY SOURCE']
+                })
+                breakdown_header_df.to_excel(
+                    writer,
+                    sheet_name='Summary',
+                    index=False,
+                    startrow=startrow,
+                    header=False
+                )
+                
+                # Add the breakdown table
+                breakdown_df.to_excel(
+                    writer,
+                    sheet_name='Summary',
+                    index=False,
+                    startrow=startrow + 1
+                )
             
             # Matched joints tab
             if not matched_joints.empty:
@@ -855,8 +955,8 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         move_pairs = pairs_generator(move_diff)
         RevMove_pairs = pairs_generator(RevMove_diff)
         
-        match_pct_move = match_pct_calc(fix_pairs, move_pairs)
-        match_pct_RevMove = match_pct_calc(fix_pairs, RevMove_pairs)
+        match_pct_move = match_pct_calc_with_distance(fix_pairs, move_pairs, fix_df, move_df, 0.05)
+        match_pct_RevMove = match_pct_calc_with_distance(fix_pairs, RevMove_pairs, fix_df, RevMove, 0.05)
         
         if match_pct_move > match_pct_RevMove:
             direction = "FWD"
@@ -1504,19 +1604,18 @@ def execute_integrated_joint_matching(engine: Engine, master_guid: str, target_g
         all_target_sorted = sorted([int(j) for j in all_target_joints])
         
         # Build list of all unmatched joints with their lengths
+        # INCLUDES zero-length joints (e.g., M53730) - they should be matchable by position
         unmatched_master = []
         for joint_num_str in final_unmatched_master:
             joint_num = int(joint_num_str)
             length = master_length_map.get(joint_num, 0)
-            if length > 0:
-                unmatched_master.append((joint_num, length))
+            unmatched_master.append((joint_num, length))  # Include ALL joints, even zero-length
         
         unmatched_target = []
         for joint_num_str in final_unmatched_target:
             joint_num = int(joint_num_str)
             length = target_length_map.get(joint_num, 0)
-            if length > 0:
-                unmatched_target.append((joint_num, length))
+            unmatched_target.append((joint_num, length))  # Include ALL joints, even zero-length
         
         absolute_distance_matches = []
         used_target_joints = set()
