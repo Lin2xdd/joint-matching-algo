@@ -1,0 +1,13 @@
+1. 100% of the CNRL sample & 99.61% of ARC sample
+2. changes
+- repair marker alignment
+- add forward, backward and cumulative to head section
+- change the criteria for mid tolerance to 30% and low to 1.5m
+- fixed one to many/many to one that finds the best match (not the first valid match)
+- added absolute distance
+- added scenario for all unmatched joints that can be merged to neighbors (essentially allowing many to manY)
+	 and use dynamic listings for consecutive unmatched joints
+- fix flow direction: overlapping pairs + cumulative distance with 5% tolerance (spatial awareness) > non-overlapping pairs
+- tiered confidence: high, mid, low
+
+3. 

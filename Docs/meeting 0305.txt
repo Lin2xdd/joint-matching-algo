@@ -1,0 +1,7 @@
+1. review of the flow
+- appended a cumulative length matching algo that is aimed to fix the 1-many and many-1 scenarios
+	- recovers at break
+	- 1-many and many-1
+	- tiered confidence: high, mid and low instead of Y/N
+
+- datasets demo
